@@ -12,7 +12,9 @@ const {
   TextInputBuilder,
   TextInputStyle,
   InteractionType,
-  EmbedBuilder
+  EmbedBuilder,
+  ChannelType,
+  PermissionFlagsBits
 } = require('discord.js')
 
 const { GoogleGenAI } = require('@google/genai')
@@ -33,6 +35,9 @@ const PORT = process.env.PORT || 3000
 const VERIFIED_ROLE = '1487219839511822530'
 const UNVERIFIED_ROLE = '1474472690831327375'
 const MOD_CHANNEL = '1474932410763186309'
+const STAFF_ROLE = '1474213205378339020'
+const TICKET_CATEGORY = '1474929234664231073'
+const TICKET_PANEL_CHANNEL = '1487956293736988753'
 
 const REFRESH_INTERVAL = 10000
 const MESSAGE_CACHE_TTL = 15000
@@ -45,9 +50,11 @@ const requests = new Map()
 const processedMessages = new Set()
 const memoryStore = new Map()
 const chatSessions = new Map()
+const openTickets = new Map()
 
 let queueMessageId = null
 let dashboardStarted = false
+let dashboardUpdating = false
 
 const LOCK_FILE = path.join('/tmp', 'limb-bot.lock')
 
@@ -287,6 +294,15 @@ function buildHelpEmbed() {
         inline: false
       },
       {
+        name: '🎫 Tickets',
+        value: [
+          '`!ticket-setup` posts the ticket panel (staff)',
+          'Click **Open a Ticket** to create a private support channel',
+          'Click **🔒 Close Ticket** inside to close it'
+        ].join('\n'),
+        inline: false
+      },
+      {
         name: '📌 Help',
         value: '`%help` shows this panel',
         inline: false
@@ -416,6 +432,50 @@ function buildDashboardEmbed(sortedRequests) {
   }
 
   return embed
+}
+
+function buildTicketPanelEmbed() {
+  return new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle('🎫 Open a Support Ticket')
+    .setDescription(
+      '> **Please only open a ticket if you genuinely need help.**\n\n' +
+      'This is not a place for casual conversation — tickets are for real issues only.\n\n' +
+      '**What counts as a valid ticket:**\n' +
+      '• You have a question staff need to answer privately\n' +
+      '• You need help with something in the server\n' +
+      '• You want to report a user or issue\n\n' +
+      'A member of the team will get back to you as soon as possible.\n' +
+      'Click the button below to get started.'
+    )
+    .setFooter({ text: 'Limb Bot • Support' })
+    .setTimestamp()
+}
+
+function buildTicketWelcomeEmbed(user) {
+  return new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle('🎫 Ticket Opened')
+    .setDescription(
+      `Welcome, <@${user.id}>.\n\n` +
+      'A staff member will be with you shortly — please be patient.\n\n' +
+      '**While you wait:**\n' +
+      '• Describe your issue clearly in one message\n' +
+      '• Include any relevant details or screenshots\n' +
+      '• Do not ping staff — they will see this\n\n' +
+      'When your issue is resolved, click **🔒 Close Ticket** below.'
+    )
+    .setFooter({ text: 'Limb Bot • Support' })
+    .setTimestamp()
+}
+
+function buildTicketCloseConfirmEmbed() {
+  return new EmbedBuilder()
+    .setColor(0xFF4444)
+    .setTitle('🔒 Close Ticket')
+    .setDescription('Are you sure you want to close this ticket? The channel will be deleted.')
+    .setFooter({ text: 'Limb Bot • Ticket System' })
+    .setTimestamp()
 }
 
 function buildFallbackReply(userId, input) {
@@ -550,17 +610,29 @@ client.once('clientReady', async () => {
       return
     }
 
-    const msg = await modChannel.send({ content: 'Loading verification dashboard...' })
-    queueMessageId = msg.id
+    const recent = await modChannel.messages.fetch({ limit: 20 }).catch(() => null)
+    const existing = recent
+      ? recent.find(m => m.author.id === client.user.id && (m.embeds.some(e => e.title?.includes('Verification Dashboard')) || m.content === 'Loading verification dashboard...'))
+      : null
+
+    if (existing) {
+      queueMessageId = existing.id
+      console.log('Recovered existing dashboard message.')
+    } else {
+      const msg = await modChannel.send({ content: 'Loading verification dashboard...' })
+      queueMessageId = msg.id
+      console.log('Created new dashboard message.')
+    }
 
     if (!dashboardStarted) {
       dashboardStarted = true
       setInterval(updateQueuePanel, REFRESH_INTERVAL)
     }
 
+    await updateQueuePanel()
     console.log('Verification dashboard initialized.')
   } catch (err) {
-    console.error(`Could not access mod channel (${MOD_CHANNEL}): ${err.message}`)
+    console.error(`Could not access mod channel (${MOD_CHANNEL}): ${err?.message || err}`)
   }
 })
 
@@ -590,6 +662,20 @@ client.on('messageCreate', async message => {
 
     return await message.channel.send({
       embeds: [buildSetupEmbed()],
+      components: [row]
+    })
+  }
+
+  if (cmd === '!ticket-setup') {
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('open_ticket')
+        .setLabel('🎫 Open a Ticket')
+        .setStyle(ButtonStyle.Primary)
+    )
+
+    return await message.channel.send({
+      embeds: [buildTicketPanelEmbed()],
       components: [row]
     })
   }
@@ -819,23 +905,28 @@ client.on('messageCreate', async message => {
 })
 
 async function updateQueuePanel() {
-  try {
-    const modChannel = await client.channels.fetch(MOD_CHANNEL)
-    if (!modChannel || !modChannel.isTextBased() || !queueMessageId) return
+  if (dashboardUpdating) return
+  dashboardUpdating = true
 
+  try {
+    if (!queueMessageId) return
+
+    const modChannel = client.channels.cache.get(MOD_CHANNEL)
+      || await client.channels.fetch(MOD_CHANNEL).catch(() => null)
+
+    if (!modChannel || !modChannel.isTextBased()) return
+
+    const guild = client.guilds.cache.first()
     const visible = Array.from(requests.entries()).slice(0, 5)
 
     for (const [userId, info] of visible) {
-      const guild = client.guilds.cache.first()
       const member = guild ? await guild.members.fetch(userId).catch(() => null) : null
-
       const nickname = member?.nickname || 'None'
-      const createdAt = info.user.createdAt.toDateString()
+      const createdAt = info.user.createdAt?.toDateString() || 'Unknown'
       const joinedAt = member?.joinedAt?.toDateString() || 'N/A'
       const roles = member
-        ? member.roles.cache.map(r => r.name).filter(name => name !== '@everyone').join(', ') || 'None'
+        ? member.roles.cache.map(r => r.name).filter(n => n !== '@everyone').join(', ') || 'None'
         : 'N/A'
-
       info.summaryText = `**Nickname:** ${nickname}\n**Created:** ${createdAt}\n**Joined:** ${joinedAt}\n**Roles:** ${roles}\n**Status:** ${info.status}`
     }
 
@@ -863,37 +954,60 @@ async function updateQueuePanel() {
       }
     }
 
-    const msg = await modChannel.messages.fetch(queueMessageId)
+    const msg = await modChannel.messages.fetch(queueMessageId).catch(() => null)
+    if (!msg) {
+      console.error('Dashboard message not found, will recreate on next restart.')
+      return
+    }
+
     await msg.edit({ content: '', embeds: [embed], components })
   } catch (err) {
     console.error('Dashboard update failed:', err?.message || err)
+  } finally {
+    dashboardUpdating = false
   }
 }
 
+const processingRequests = new Set()
+
 async function resolveRequest(userId, status, reason = null) {
-  const guild = client.guilds.cache.first()
-  const target = guild ? await guild.members.fetch(userId).catch(() => null) : null
+  if (processingRequests.has(userId)) return
+  processingRequests.add(userId)
 
-  if (status === 'approved' && target) {
-    await target.roles.add(VERIFIED_ROLE).catch(() => {})
-    await target.roles.remove(UNVERIFIED_ROLE).catch(() => {})
-    await target.send('✅ Your verification has been approved. You now have the Verified role.').catch(() => {})
-  }
+  try {
+    const guild = client.guilds.cache.first()
+    const target = guild ? await guild.members.fetch(userId).catch(() => null) : null
 
-  if (status === 'denied' && target) {
-    await target.send(`❌ Your verification was denied${reason ? `: ${reason}` : ''}\nYou may re-request verification immediately.`).catch(() => {})
-  }
+    if (status === 'approved' && target) {
+      await target.roles.add(VERIFIED_ROLE).catch(err => console.error(`Failed to add Verified role to ${userId}:`, err?.message))
+      await target.roles.remove(UNVERIFIED_ROLE).catch(err => console.error(`Failed to remove Unverified role from ${userId}:`, err?.message))
+      await target.send('✅ Your verification has been **approved**. Welcome to the server — you now have the Verified role.').catch(() => {})
+      console.log(`Approved verification for ${userId}`)
+    }
 
-  if (requests.has(userId)) {
-    requests.set(userId, { ...requests.get(userId), status })
-  }
+    if (status === 'denied' && target) {
+      const msg = reason
+        ? `❌ Your verification was **denied**.\n**Reason:** ${reason}\n\nYou may re-request at any time.`
+        : `❌ Your verification was **denied**.\n\nYou may re-request at any time.`
+      await target.send(msg).catch(() => {})
+      console.log(`Denied verification for ${userId}${reason ? ` (reason: ${reason})` : ''}`)
+    }
 
-  await updateQueuePanel()
+    if (requests.has(userId)) {
+      requests.set(userId, { ...requests.get(userId), status })
+    }
 
-  setTimeout(async () => {
-    requests.delete(userId)
     await updateQueuePanel()
-  }, 5000)
+
+    setTimeout(async () => {
+      requests.delete(userId)
+      processingRequests.delete(userId)
+      await updateQueuePanel()
+    }, 5000)
+  } catch (err) {
+    console.error(`resolveRequest error for ${userId}:`, err?.message || err)
+    processingRequests.delete(userId)
+  }
 }
 
 client.on('interactionCreate', async interaction => {
@@ -908,12 +1022,12 @@ client.on('interactionCreate', async interaction => {
         })
       }
 
+      await interaction.deferReply({ ephemeral: true })
       const reason = interaction.fields.getTextInputValue('deny_reason')
       await resolveRequest(userId, 'denied', reason)
 
-      return await interaction.reply({
-        content: `❌ Denied <@${userId}> for reason: ${reason}`,
-        ephemeral: true
+      return await interaction.editReply({
+        content: `❌ Denied <@${userId}>${reason ? ` — reason: ${reason}` : ''}`
       })
     }
 
@@ -925,17 +1039,19 @@ client.on('interactionCreate', async interaction => {
   if (interaction.customId === 'start_verify') {
     if (!interaction.user.avatar) {
       return await interaction.reply({
-        content: 'You must set a custom profile picture before verifying.',
+        content: '❌ You need a custom profile picture before you can verify.',
         ephemeral: true
       })
     }
 
     if (requests.has(interaction.user.id) && requests.get(interaction.user.id).status === 'pending') {
       return await interaction.reply({
-        content: 'You already have a verification request in progress.',
+        content: '⏳ You already have a verification request in progress. Please wait for staff to review it.',
         ephemeral: true
       })
     }
+
+    await interaction.deferReply({ ephemeral: true })
 
     requests.set(interaction.user.id, {
       user: interaction.user,
@@ -944,14 +1060,10 @@ client.on('interactionCreate', async interaction => {
     })
 
     await updateQueuePanel()
+    await interaction.user.send('📋 Your verification request has been received. Staff will review it shortly.').catch(() => {})
 
-    try {
-      await interaction.user.send('Your verification request is in the queue. Staff will review shortly.')
-    } catch {}
-
-    return await interaction.reply({
-      content: 'Your request has been sent to staff. You will receive a DM once processed.',
-      ephemeral: true
+    return await interaction.editReply({
+      content: '✅ Your request has been sent to staff. You will be notified by DM once it is reviewed.'
     })
   }
 
@@ -960,16 +1072,18 @@ client.on('interactionCreate', async interaction => {
 
     if (!requests.has(userId)) {
       return await interaction.reply({
-        content: 'Request already processed.',
+        content: 'This request has already been processed.',
         ephemeral: true
       })
     }
+
+    await interaction.deferReply({ ephemeral: true })
 
     const info = requests.get(userId)
     const member = interaction.guild ? await interaction.guild.members.fetch(userId).catch(() => null) : null
 
     const nickname = member?.nickname || 'None'
-    const createdAt = info.user.createdAt.toDateString()
+    const createdAt = info.user.createdAt?.toDateString() || 'Unknown'
     const joinedAt = member?.joinedAt?.toDateString() || 'N/A'
     const roles = member
       ? member.roles.cache.map(r => r.name).filter(name => name !== '@everyone').join(', ') || 'None'
@@ -977,9 +1091,8 @@ client.on('interactionCreate', async interaction => {
 
     const avatarUrl = info.user.displayAvatarURL({ dynamic: true, size: 256 })
 
-    return await interaction.reply({
-      embeds: [buildUserInfoEmbed(info.user, nickname, createdAt, joinedAt, roles, avatarUrl)],
-      ephemeral: true
+    return await interaction.editReply({
+      embeds: [buildUserInfoEmbed(info.user, nickname, createdAt, joinedAt, roles, avatarUrl)]
     })
   }
 
@@ -993,11 +1106,18 @@ client.on('interactionCreate', async interaction => {
       })
     }
 
+    if (processingRequests.has(userId)) {
+      return await interaction.reply({
+        content: '⏳ Already processing this request, please wait.',
+        ephemeral: true
+      })
+    }
+
+    await interaction.deferReply({ ephemeral: false })
     await resolveRequest(userId, 'approved')
 
-    return await interaction.reply({
-      content: `✅ Approved <@${userId}>`,
-      ephemeral: false
+    return await interaction.editReply({
+      content: `✅ <@${userId}> has been approved and given the Verified role.`
     })
   }
 
@@ -1024,6 +1144,143 @@ client.on('interactionCreate', async interaction => {
     modal.addComponents(new ActionRowBuilder().addComponents(input))
 
     return await interaction.showModal(modal)
+  }
+
+  if (interaction.customId === 'open_ticket') {
+    const { guild, user } = interaction
+
+    if (openTickets.has(user.id)) {
+      const existing = guild.channels.cache.get(openTickets.get(user.id))
+      if (existing) {
+        return await interaction.reply({
+          content: `You already have an open ticket: ${existing}`,
+          ephemeral: true
+        })
+      }
+      openTickets.delete(user.id)
+    }
+
+    const safeName = user.username.toLowerCase().replace(/[^a-z0-9]/g, '-')
+    const channelName = `ticket-${safeName}`
+
+    const permissionOverwrites = [
+      {
+        id: guild.roles.everyone.id,
+        deny: [PermissionFlagsBits.ViewChannel]
+      },
+      {
+        id: user.id,
+        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory]
+      }
+    ]
+
+    if (STAFF_ROLE) {
+      permissionOverwrites.push({
+        id: STAFF_ROLE,
+        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages]
+      })
+    }
+
+    const ticketChannel = await guild.channels.create({
+      name: channelName,
+      type: ChannelType.GuildText,
+      parent: TICKET_CATEGORY || null,
+      permissionOverwrites,
+      topic: `Ticket opened by ${user.tag} — ${new Date().toUTCString()}`
+    }).catch(err => {
+      console.error('Failed to create ticket channel:', err?.message || err)
+      return null
+    })
+
+    if (!ticketChannel) {
+      return await interaction.reply({
+        content: '❌ Failed to create ticket channel. Make sure the bot has Manage Channels permission.',
+        ephemeral: true
+      })
+    }
+
+    openTickets.set(user.id, ticketChannel.id)
+
+    const closeRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`close_ticket_${user.id}`)
+        .setLabel('🔒 Close Ticket')
+        .setStyle(ButtonStyle.Danger)
+    )
+
+    await ticketChannel.send({
+      embeds: [buildTicketWelcomeEmbed(user)],
+      components: [closeRow]
+    })
+
+    return await interaction.reply({
+      content: `✅ Your ticket has been opened: ${ticketChannel}`,
+      ephemeral: true
+    })
+  }
+
+  if (interaction.customId.startsWith('close_ticket_')) {
+    const ticketOwnerId = interaction.customId.split('_')[2]
+    const member = interaction.guild.members.cache.get(interaction.user.id)
+    const isStaff = STAFF_ROLE
+      ? member?.roles.cache.has(STAFF_ROLE)
+      : member?.permissions.has(PermissionFlagsBits.ManageChannels)
+
+    if (interaction.user.id !== ticketOwnerId && !isStaff) {
+      return await interaction.reply({
+        content: '❌ Only the ticket owner or staff can close this ticket.',
+        ephemeral: true
+      })
+    }
+
+    const confirmRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`confirm_close_${interaction.channel.id}_${ticketOwnerId}`)
+        .setLabel('✅ Confirm Close')
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId('cancel_close')
+        .setLabel('❌ Cancel')
+        .setStyle(ButtonStyle.Secondary)
+    )
+
+    return await interaction.reply({
+      embeds: [buildTicketCloseConfirmEmbed()],
+      components: [confirmRow],
+      ephemeral: true
+    })
+  }
+
+  if (interaction.customId.startsWith('confirm_close_')) {
+    const parts = interaction.customId.split('_')
+    const channelId = parts[2]
+    const ticketOwnerId = parts[3]
+
+    openTickets.delete(ticketOwnerId)
+
+    const channel = interaction.guild.channels.cache.get(channelId)
+
+    if (!channel) {
+      return await interaction.reply({
+        content: '❌ Channel not found.',
+        ephemeral: true
+      })
+    }
+
+    await interaction.reply({ content: '🔒 Closing ticket...', ephemeral: true }).catch(() => {})
+
+    setTimeout(() => {
+      channel.delete('Ticket closed').catch(err => {
+        console.error('Failed to delete ticket channel:', err?.message || err)
+      })
+    }, 1500)
+  }
+
+  if (interaction.customId === 'cancel_close') {
+    return await interaction.reply({
+      content: '✅ Close cancelled.',
+      ephemeral: true
+    })
   }
 })
 
