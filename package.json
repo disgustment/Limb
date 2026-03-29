@@ -1,13 +1,17 @@
 {
-  "name": "@workspace/bot",
+  "name": "workspace",
   "version": "0.0.0",
   "private": true,
-  "type": "commonjs",
+  "license": "MIT",
+  "packageManager": "pnpm@10.0.0",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node index.js"
+    "start": "node bot/index.js"
+  },
+  "engines": {
+    "node": "20.x"
   },
   "dependencies": {
-    "discord.js": "^14"
+    "@google/genai": "^1.46.0",
+    "discord.js": "^14.25.1"
   }
 }
