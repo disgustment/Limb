@@ -1,25 +1,13 @@
 {
-  "name": "workspace",
+  "name": "@workspace/bot",
   "version": "0.0.0",
   "private": true,
-  "license": "MIT",
-  "packageManager": "pnpm@10.0.0",
+  "type": "commonjs",
   "scripts": {
-    "start": "node bot/index.js",
-    "preinstall": "sh -c 'rm -f package-lock.json yarn.lock; case \"$npm_config_user_agent\" in pnpm/*) ;; *) echo \"Use pnpm instead\" >&2; exit 1 ;; esac'",
-    "build": "pnpm run typecheck && pnpm -r --if-present run build",
-    "typecheck:libs": "tsc --build",
-    "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --filter \"./scripts\" --if-present run typecheck"
-  },
-  "engines": {
-    "node": "20.x"
-  },
-  "devDependencies": {
-    "prettier": "^3.8.1",
-    "typescript": "~5.9.2"
+    "start": "node index.js",
+    "dev": "node index.js"
   },
   "dependencies": {
-    "@google/genai": "^1.46.0",
-    "discord.js": "^14.25.1"
+    "discord.js": "^14"
   }
 }
