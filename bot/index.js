@@ -1,3 +1,5 @@
+const fs = require('fs')
+const path = require('path')
 const http = require('http')
 const {
   Client,
@@ -24,15 +26,97 @@ process.on('uncaughtException', err => {
   console.error('Uncaught exception:', err?.message || err)
 })
 
+const TOKEN = process.env.DISCORD_TOKEN
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY
 const PORT = process.env.PORT || 3000
-http.createServer((req, res) => {
+
+const VERIFIED_ROLE = '1487219839511822530'
+const UNVERIFIED_ROLE = '1474472690831327375'
+const MOD_CHANNEL = '1474932410763186309'
+
+const REFRESH_INTERVAL = 10000
+const MESSAGE_CACHE_TTL = 15000
+const CHAT_SESSION_MS = 15 * 60 * 1000
+const MAX_MEMORY = 16
+
+const gemini = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null
+
+const requests = new Map()
+const processedMessages = new Set()
+const memoryStore = new Map()
+const chatSessions = new Map()
+
+let queueMessageId = null
+let dashboardStarted = false
+
+const LOCK_FILE = path.join('/tmp', 'limb-bot.lock')
+
+function acquireProcessLock() {
+  try {
+    if (fs.existsSync(LOCK_FILE)) {
+      const existingPid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10)
+
+      if (!Number.isNaN(existingPid)) {
+        try {
+          process.kill(existingPid, 0)
+          console.log(`Another bot instance is already running with PID ${existingPid}. Exiting this one.`)
+          process.exit(0)
+        } catch {
+          fs.unlinkSync(LOCK_FILE)
+        }
+      } else {
+        fs.unlinkSync(LOCK_FILE)
+      }
+    }
+
+    fs.writeFileSync(LOCK_FILE, String(process.pid), 'utf8')
+
+    const cleanup = () => {
+      try {
+        if (fs.existsSync(LOCK_FILE)) {
+          const pidInFile = fs.readFileSync(LOCK_FILE, 'utf8').trim()
+          if (pidInFile === String(process.pid)) {
+            fs.unlinkSync(LOCK_FILE)
+          }
+        }
+      } catch {}
+    }
+
+    process.on('exit', cleanup)
+    process.on('SIGINT', () => {
+      cleanup()
+      process.exit(0)
+    })
+    process.on('SIGTERM', () => {
+      cleanup()
+      process.exit(0)
+    })
+  } catch (err) {
+    console.error('Failed to acquire process lock:', err?.message || err)
+    process.exit(1)
+  }
+}
+
+acquireProcessLock()
+
+const healthServer = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' })
   res.end(JSON.stringify({
     ok: true,
     service: 'limb-bot',
     time: new Date().toISOString()
   }))
-}).listen(PORT, '0.0.0.0', () => {
+})
+
+healthServer.on('error', err => {
+  if (err.code === 'EADDRINUSE') {
+    console.log(`Health server port ${PORT} is already in use. Skipping health server on this process.`)
+    return
+  }
+  console.error('Health server error:', err?.message || err)
+})
+
+healthServer.listen(PORT, '0.0.0.0', () => {
   console.log(`Health server listening on ${PORT}`)
 })
 
@@ -45,28 +129,6 @@ const client = new Client({
   ],
   partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 })
-
-const TOKEN = process.env.DISCORD_TOKEN
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY
-
-const gemini = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null
-
-const VERIFIED_ROLE = '1487219839511822530'
-const UNVERIFIED_ROLE = '1474472690831327375'
-const MOD_CHANNEL = '1474932410763186309'
-
-const REFRESH_INTERVAL = 10000
-const MESSAGE_CACHE_TTL = 15000
-const CHAT_SESSION_MS = 15 * 60 * 1000
-const MAX_HISTORY = 14
-
-const requests = new Map()
-const processedMessages = new Set()
-const memoryStore = new Map()
-const chatSessions = new Map()
-
-let queueMessageId = null
-let dashboardStarted = false
 
 function rememberMessage(messageId) {
   processedMessages.add(messageId)
@@ -91,6 +153,29 @@ function getStatusEmoji(status, position) {
   return position === 0 ? '🔹' : '🕒'
 }
 
+function getMemory(userId) {
+  if (!memoryStore.has(userId)) memoryStore.set(userId, [])
+  return memoryStore.get(userId)
+}
+
+function pushMemory(userId, role, content) {
+  const memory = getMemory(userId)
+  memory.push({ role, content, at: Date.now() })
+  if (memory.length > MAX_MEMORY) {
+    memory.splice(0, memory.length - MAX_MEMORY)
+  }
+}
+
+function getPreviousUserMessage(userId, current) {
+  const memory = getMemory(userId)
+  const userMessages = memory.filter(x => x.role === 'user').map(x => x.content)
+  if (userMessages.length <= 1) return null
+  for (let i = userMessages.length - 2; i >= 0; i--) {
+    if (userMessages[i] !== current) return userMessages[i]
+  }
+  return null
+}
+
 function sessionKey(message) {
   return `${message.guildId || 'dm'}:${message.channel.id}:${message.author.id}`
 }
@@ -99,10 +184,12 @@ function getSession(message) {
   const key = sessionKey(message)
   const session = chatSessions.get(key)
   if (!session) return null
+
   if (Date.now() - session.lastActive > CHAT_SESSION_MS) {
     chatSessions.delete(key)
     return null
   }
+
   return session
 }
 
@@ -126,27 +213,38 @@ function isReplyToBot(message) {
   )
 }
 
-function getMemory(userId) {
-  if (!memoryStore.has(userId)) memoryStore.set(userId, [])
-  return memoryStore.get(userId)
-}
+function shouldTriggerBotChat(message, cmd, content) {
+  const mentioned = message.mentions.has(client.user)
+  const replied = isReplyToBot(message)
+  const session = getSession(message)
+  const isTalkCommand = cmd === '%talk'
+  const isStopCommand = cmd === '%stop' || cmd === '%bye'
 
-function pushMemory(userId, role, content) {
-  const memory = getMemory(userId)
-  memory.push({ role, content, at: Date.now() })
-  if (memory.length > MAX_HISTORY) {
-    memory.splice(0, memory.length - MAX_HISTORY)
+  if (isStopCommand) {
+    return { should: true, stop: true, input: '' }
   }
-}
 
-function getPreviousUserMessage(userId, current) {
-  const memory = getMemory(userId)
-  const userMessages = memory.filter(x => x.role === 'user').map(x => x.content)
-  if (userMessages.length <= 1) return null
-  for (let i = userMessages.length - 2; i >= 0; i--) {
-    if (userMessages[i] !== current) return userMessages[i]
+  if (isTalkCommand) {
+    return { should: true, stop: false, input: content.slice(5).trim() }
   }
-  return null
+
+  if (mentioned) {
+    return {
+      should: true,
+      stop: false,
+      input: stripBotMention(content, client.user.id)
+    }
+  }
+
+  if (replied) {
+    return { should: true, stop: false, input: content }
+  }
+
+  if (session) {
+    return { should: true, stop: false, input: content }
+  }
+
+  return { should: false, stop: false, input: '' }
 }
 
 function buildHelpEmbed() {
@@ -374,14 +472,6 @@ function buildFallbackReply(userId, input) {
     ])
   }
 
-  if (containsAny(text, ['joke', 'make me laugh'])) {
-    return randomPick([
-      'i would tell you a construction joke but i’m still working on it',
-      'i’m funny in a low maintenance way',
-      'one file goes missing and suddenly i’m acting like the whole world ended'
-    ])
-  }
-
   if (containsAny(text, ['bye', 'goodbye', 'cya', 'see you'])) {
     return randomPick([
       'alright, catch you later',
@@ -414,9 +504,7 @@ function buildFallbackReply(userId, input) {
     'what happened next',
     'why does that matter to you',
     'break that down for me',
-    'keep going',
-    'what’s the part you’re not saying yet',
-    'start where it really began'
+    'keep going'
   ])
 }
 
@@ -424,23 +512,17 @@ async function buildGeminiReply(userId, input) {
   if (!gemini) return null
 
   const memory = getMemory(userId)
-
   const historyText = memory
     .map(entry => `${entry.role === 'user' ? 'User' : 'Bot'}: ${entry.content}`)
     .join('\n')
 
   const prompt = [
     'You are Limb Bot in a Discord server.',
-    'Your vibe is cute, friendly, playful, a little teasing, and emotionally aware.',
-    'You type naturally like a real online person.',
+    'Your vibe is cute, friendly, playful, a little teasing, emotionally aware, and natural.',
+    'Type like a real online person.',
     'Use lowercase most of the time.',
     'Do not sound robotic.',
-    'Do not mention AI, prompts, system instructions, or policy.',
     'Keep most replies between 1 and 4 sentences unless the user asks for more.',
-    'Be warm and personal when the user is vulnerable.',
-    'Be funny and light when the mood is playful.',
-    'Be serious when the topic is serious.',
-    'Do not get sexual.',
     '',
     historyText,
     '',
@@ -449,22 +531,15 @@ async function buildGeminiReply(userId, input) {
   ].join('\n')
 
   const response = await gemini.models.generateContent({
-    model: 'gemini-3-flash-preview',
-    contents: prompt,
-    config: {
-      systemInstruction: 'You are Limb Bot, a cute, friendly, natural sounding Discord bot who chats like a real online person. Stay coherent, emotionally aware, and concise.',
-      thinkingConfig: {
-        thinkingLevel: 'low'
-      }
-    }
+    model: 'gemini-2.5-flash',
+    contents: prompt
   })
 
   const text = response.text?.trim()
-  if (!text) return null
-  return text
+  return text || null
 }
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`)
 
   try {
@@ -705,38 +780,42 @@ client.on('messageCreate', async message => {
 
   const trigger = shouldTriggerBotChat(message, cmd, content)
 
-  if (!trigger.should) return
+  if (trigger.should) {
+    if (trigger.stop) {
+      endSession(message)
+      return await message.reply('conversation ended. start again with `%talk` or by mentioning me.')
+    }
 
-  if (trigger.stop) {
-    endSession(message)
-    return await message.reply('conversation ended. start again with `%talk` or by mentioning me.')
+    const input = trigger.input?.trim()
+
+    if (!input) {
+      return await message.reply('say something.')
+    }
+
+    pushMemory(message.author.id, 'user', input)
+
+    await message.channel.sendTyping()
+
+    let reply = null
+
+    try {
+      reply = await buildGeminiReply(message.author.id, input)
+      console.log('Gemini reply success for', message.author.tag)
+    } catch (err) {
+      console.error('Gemini chat error:', err?.message || err)
+    }
+
+    if (!reply) {
+      reply = buildFallbackReply(message.author.id, input)
+      console.log('Using fallback reply for', message.author.tag)
+    }
+
+    pushMemory(message.author.id, 'bot', reply)
+
+    const sent = await message.reply(reply)
+    touchSession(message, sent.id)
+    return
   }
-
-  const input = trigger.input
-  if (!input) {
-    return await message.reply('say something.')
-  }
-
-  pushMemory(message.author.id, 'user', input)
-
-  await message.channel.sendTyping()
-
-  let reply = null
-
-  try {
-    reply = await buildGeminiReply(message.author.id, input)
-  } catch (err) {
-    console.error('Gemini chat error:', err?.message || err)
-  }
-
-  if (!reply) {
-    reply = buildFallbackReply(message.author.id, input)
-  }
-
-  pushMemory(message.author.id, 'bot', reply)
-
-  const sent = await message.reply(reply)
-  touchSession(message, sent.id)
 })
 
 async function updateQueuePanel() {
