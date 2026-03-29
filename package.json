@@ -3,7 +3,6 @@
   "version": "0.0.0",
   "private": true,
   "license": "MIT",
-  "packageManager": "pnpm@10.0.0",
   "scripts": {
     "start": "node bot/index.js"
   },
