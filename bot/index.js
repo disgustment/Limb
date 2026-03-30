@@ -14,7 +14,8 @@ const {
   InteractionType,
   EmbedBuilder,
   ChannelType,
-  PermissionFlagsBits
+  PermissionFlagsBits,
+  StringSelectMenuBuilder
 } = require('discord.js')
 
 const { GoogleGenAI } = require('@google/genai')
@@ -41,6 +42,8 @@ const TICKET_PANEL_CHANNEL = '1487956293736988753'
 const WELCOME_CHANNEL = '1487993335519117465'
 const RULES_CHANNEL = '1474932410763186306'
 const VERIFY_CHANNEL = '1487211537335849081'
+const VOICEMASTER_MENU_CHANNEL = '1488017411168010340'
+const VOICEMASTER_CREATE_CHANNEL = '1488017412736680037'
 
 const REFRESH_INTERVAL = 10000
 const MESSAGE_CACHE_TTL = 15000
@@ -54,10 +57,13 @@ const processedMessages = new Set()
 const memoryStore = new Map()
 const chatSessions = new Map()
 const openTickets = new Map()
+const tempVoiceOwners = new Map()
+const userOwnedTempChannels = new Map()
 
 let queueMessageId = null
 let dashboardStarted = false
 let dashboardUpdating = false
+let verificationLogMessageId = null
 
 const LOCK_FILE = path.join('/tmp', 'limb-bot.lock')
 
@@ -135,6 +141,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.MessageContent
   ],
   partials: [Partials.Message, Partials.Channel, Partials.Reaction]
@@ -239,71 +246,173 @@ function shouldTriggerBotChat(message, cmd, content) {
   return { should: false, stop: false, input: '' }
 }
 
-function buildHelpEmbed() {
+function hasStaffAccess(member) {
+  return Boolean(
+    member &&
+    (
+      member.permissions.has(PermissionFlagsBits.ManageGuild) ||
+      member.permissions.has(PermissionFlagsBits.ManageChannels) ||
+      (STAFF_ROLE && member.roles.cache.has(STAFF_ROLE))
+    )
+  )
+}
+
+function buildHelpHomeEmbed() {
   return new EmbedBuilder()
     .setColor(0x00FFFF)
-    .setTitle('⚡ Limb Bot Command Panel')
-    .setDescription('Everything you need is right here.')
+    .setTitle('Limb Bot')
+    .setDescription('clean setup, smooth systems, and the stuff you actually need')
     .addFields(
       {
-        name: '💬 Bot Chat',
+        name: 'Categories',
         value: [
-          '`%talk <message>` starts a conversation',
-          '`@BotName <message>` also starts one',
-          'After that, keep talking normally for 15 minutes',
-          'Reply to the bot any time to continue',
-          '`%stop` ends the conversation'
+          'Moderation',
+          'Economy',
+          'Information',
+          'Fun',
+          'Config',
+          'Tickets',
+          'Voicemaster'
         ].join('\n'),
-        inline: false
+        inline: true
       },
       {
-        name: '💰 Economy',
+        name: 'Quick Links',
         value: [
-          '`%bal [@user]`',
-          '`%daily`',
-          '`%work`',
-          '`%pay @user <amount>`',
-          '`%lb`',
-          '`%slots <amount>`',
-          '`%coinflip <heads/tails> <amount>`'
+          `Support: <#${TICKET_PANEL_CHANNEL}>`,
+          `Rules: <#${RULES_CHANNEL}>`,
+          `Verify: <#${VERIFY_CHANNEL}>`
         ].join('\n'),
-        inline: false
-      },
-      {
-        name: '🛡️ Verification',
-        value: [
-          '`!setup` posts the verification panel',
-          'Staff review requests from the dashboard',
-          'Approve, deny, or inspect users from one place'
-        ].join('\n'),
-        inline: false
-      },
-      {
-        name: '🎫 Tickets',
-        value: [
-          '`!ticket-setup` posts the ticket panel',
-          'Click **Open a Ticket** to create a private support channel',
-          'Click **🔒 Close Ticket** inside to close it'
-        ].join('\n'),
-        inline: false
-      },
-      {
-        name: '👋 Welcome',
-        value: [
-          'New members get a welcome embed automatically',
-          '`!testwelcome [@user]` sends a test welcome embed',
-          `Welcome channel: <#${WELCOME_CHANNEL}>`
-        ].join('\n'),
-        inline: false
-      },
-      {
-        name: '📌 Help',
-        value: '`%help` shows this panel',
-        inline: false
+        inline: true
       }
     )
-    .setFooter({ text: 'Limb Bot • Command Center' })
+    .setFooter({ text: 'Select a category from the dropdown menu below' })
     .setTimestamp()
+}
+
+function buildHelpCategoryEmbed(category) {
+  const embed = new EmbedBuilder()
+    .setColor(0x00FFFF)
+    .setTimestamp()
+    .setFooter({ text: 'Select a category from the dropdown menu below' })
+
+  if (category === 'moderation') {
+    return embed
+      .setTitle('Moderation')
+      .setDescription([
+        '`!setup` posts the verification panel',
+        '`!verify-refresh` refreshes the verification dashboard',
+        'Use the dashboard buttons to view, approve, deny, and refresh',
+        'The dashboard now keeps one rolling action log instead of flooding the channel'
+      ].join('\n'))
+  }
+
+  if (category === 'economy') {
+    return embed
+      .setTitle('Economy')
+      .setDescription([
+        '`%bal [@user]`',
+        '`%daily`',
+        '`%work`',
+        '`%pay @user <amount>`',
+        '`%lb`',
+        '`%slots <amount>`',
+        '`%coinflip <heads/tails> <amount>`'
+      ].join('\n'))
+  }
+
+  if (category === 'information') {
+    return embed
+      .setTitle('Information')
+      .setDescription([
+        '`%help` opens this help menu',
+        '`!testwelcome [@user]` sends a welcome test',
+        `Welcome channel: <#${WELCOME_CHANNEL}>`,
+        `Rules channel: <#${RULES_CHANNEL}>`
+      ].join('\n'))
+  }
+
+  if (category === 'fun') {
+    return embed
+      .setTitle('Fun')
+      .setDescription([
+        '`%talk <message>` starts a conversation',
+        '`@BotName <message>` also starts one',
+        '`%stop` ends the current conversation',
+        'Reply to the bot to keep chatting'
+      ].join('\n'))
+  }
+
+  if (category === 'config') {
+    return embed
+      .setTitle('Config')
+      .setDescription([
+        '`!setup` verification setup',
+        '`!ticket-setup` ticket setup',
+        '`!voicemaster-setup` voicemaster setup',
+        '`!verify-refresh` dashboard refresh'
+      ].join('\n'))
+  }
+
+  if (category === 'tickets') {
+    return embed
+      .setTitle('Tickets')
+      .setDescription([
+        '`!ticket-setup` posts the support panel',
+        'Click **Open a Ticket** to create a private channel',
+        'Click **🔒 Close Ticket** inside to close it',
+        `Panel channel: <#${TICKET_PANEL_CHANNEL}>`
+      ].join('\n'))
+  }
+
+  if (category === 'voicemaster') {
+    return embed
+      .setTitle('Voicemaster')
+      .setDescription([
+        '`!voicemaster-setup` posts the voice menu panel',
+        `Join <#${VOICEMASTER_CREATE_CHANNEL}> to create your own voice`,
+        'Use the menu buttons to rename, set limit, lock, unlock, hide, show, or claim'
+      ].join('\n'))
+  }
+
+  return buildHelpHomeEmbed()
+}
+
+function buildHelpComponents(guildId) {
+  const select = new StringSelectMenuBuilder()
+    .setCustomId('help_category_select')
+    .setPlaceholder('Choose a help category')
+    .addOptions(
+      { label: 'Moderation', value: 'moderation', description: 'verification and staff tools' },
+      { label: 'Economy', value: 'economy', description: 'coins and games' },
+      { label: 'Information', value: 'information', description: 'welcome and info commands' },
+      { label: 'Fun', value: 'fun', description: 'chat features' },
+      { label: 'Config', value: 'config', description: 'setup commands' },
+      { label: 'Tickets', value: 'tickets', description: 'support system' },
+      { label: 'Voicemaster', value: 'voicemaster', description: 'temporary voice system' }
+    )
+
+  const inviteUrl = `https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=8&scope=bot%20applications.commands`
+  const supportUrl = guildId ? `https://discord.com/channels/${guildId}/${TICKET_PANEL_CHANNEL}` : 'https://discord.gg/limb'
+  const communityUrl = 'https://discord.gg/limb'
+
+  const row1 = new ActionRowBuilder().addComponents(select)
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setStyle(ButtonStyle.Link)
+      .setLabel('Invite')
+      .setURL(inviteUrl),
+    new ButtonBuilder()
+      .setStyle(ButtonStyle.Link)
+      .setLabel('Support')
+      .setURL(supportUrl),
+    new ButtonBuilder()
+      .setStyle(ButtonStyle.Link)
+      .setLabel('Discord')
+      .setURL(communityUrl)
+  )
+
+  return [row1, row2]
 }
 
 function buildSetupEmbed() {
@@ -403,6 +512,10 @@ function buildDashboardEmbed(sortedRequests) {
     .setColor(0x00FFFF)
     .setTitle('🛡️ Verification Dashboard')
     .setDescription(`Total pending requests: **${pendingCount}**`)
+    .addFields({
+      name: 'Quick Actions',
+      value: 'Use the refresh button below to reload the queue instantly.'
+    })
     .setFooter({ text: 'Limb Bot • Staff Dashboard' })
     .setTimestamp()
 
@@ -428,13 +541,31 @@ function buildDashboardEmbed(sortedRequests) {
   return embed
 }
 
+function buildVerificationLogEmbed(userId, status, reason = null, moderatorTag = 'Unknown') {
+  const color = status === 'approved' ? 0x57F287 : 0xED4245
+  const action = status === 'approved' ? 'Approved' : 'Denied'
+
+  return new EmbedBuilder()
+    .setColor(color)
+    .setTitle(`Latest Verification Action • ${action}`)
+    .setDescription(
+      [
+        `User: <@${userId}>`,
+        `Moderator: **${moderatorTag}**`,
+        reason ? `Reason: **${reason}**` : null
+      ].filter(Boolean).join('\n')
+    )
+    .setFooter({ text: 'Limb Bot • Verification Log' })
+    .setTimestamp()
+}
+
 function buildTicketPanelEmbed() {
   return new EmbedBuilder()
     .setColor(0x5865F2)
     .setTitle('🎫 Open a Support Ticket')
     .setDescription(
       '> **Please only open a ticket if you genuinely need help.**\n\n' +
-      'This is not a place for casual conversation — tickets are for real issues only.\n\n' +
+      'This is not a place for casual conversation. Tickets are for real issues only.\n\n' +
       '**What counts as a valid ticket:**\n' +
       '• You have a question staff need to answer privately\n' +
       '• You need help with something in the server\n' +
@@ -452,11 +583,11 @@ function buildTicketWelcomeEmbed(user) {
     .setTitle('🎫 Ticket Opened')
     .setDescription(
       `Welcome, <@${user.id}>.\n\n` +
-      'A staff member will be with you shortly — please be patient.\n\n' +
+      'A staff member will be with you shortly. Please be patient.\n\n' +
       '**While you wait:**\n' +
       '• Describe your issue clearly in one message\n' +
       '• Include any relevant details or screenshots\n' +
-      '• Do not ping staff — they will see this\n\n' +
+      '• Do not ping staff\n\n' +
       'When your issue is resolved, click **🔒 Close Ticket** below.'
     )
     .setFooter({ text: 'Limb Bot • Support' })
@@ -478,15 +609,49 @@ function buildWelcomeEmbed(member) {
     .setTitle('**Welcome to Limb!**')
     .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }))
     .setDescription(
-      `Hey **${member.user.username}**, welcome to **Limb** \n\n` +
-      `> <#${TICKET_PANEL_CHANNEL}>\n` +
-      `> <#${RULES_CHANNEL}>\n` +
-      `> <#${VERIFY_CHANNEL}>\n\n` +
-      
-      'Enjoy your stay at Limb, have fun, and make yourself at home!'
+      `hey **${member.user.username}**, welcome to **Limb**\n\n` +
+      `> 🎫 support: <#${TICKET_PANEL_CHANNEL}>\n` +
+      `> 📜 rules: <#${RULES_CHANNEL}>\n` +
+      `> ✅ verify: <#${VERIFY_CHANNEL}>\n\n` +
+      'enjoy your stay at Limb and make yourself at home :3'
     )
     .setFooter({ text: 'Limb • Welcome' })
     .setTimestamp()
+}
+
+function buildVoiceMasterPanelEmbed() {
+  return new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle('🔊 VoiceMaster')
+    .setDescription(
+      `join <#${VOICEMASTER_CREATE_CHANNEL}> to create your own voice channel.\n\n` +
+      '**controls:**\n' +
+      '• rename\n' +
+      '• limit\n' +
+      '• lock and unlock\n' +
+      '• hide and show\n' +
+      '• claim if the owner leaves\n\n' +
+      'stand in your temp channel first, then use the buttons below.'
+    )
+    .setFooter({ text: 'Limb Bot • VoiceMaster' })
+    .setTimestamp()
+}
+
+function buildVoiceMasterRows() {
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('vm_rename').setLabel('✏️ Rename').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('vm_limit').setLabel('👥 Limit').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('vm_lock').setLabel('🔒 Lock').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('vm_unlock').setLabel('🔓 Unlock').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('vm_claim').setLabel('👑 Claim').setStyle(ButtonStyle.Success)
+  )
+
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('vm_hide').setLabel('🙈 Hide').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('vm_show').setLabel('👀 Show').setStyle(ButtonStyle.Secondary)
+  )
+
+  return [row1, row2]
 }
 
 async function sendWelcomeEmbed(member) {
@@ -546,6 +711,168 @@ async function buildGeminiReply(userId, input) {
   return text || null
 }
 
+async function postVerificationActionLog(userId, status, moderatorTag, reason = null) {
+  try {
+    const modChannel = client.channels.cache.get(MOD_CHANNEL)
+      || await client.channels.fetch(MOD_CHANNEL).catch(() => null)
+
+    if (!modChannel || !modChannel.isTextBased()) return
+
+    const embed = buildVerificationLogEmbed(userId, status, reason, moderatorTag)
+
+    if (verificationLogMessageId) {
+      const existing = await modChannel.messages.fetch(verificationLogMessageId).catch(() => null)
+      if (existing) {
+        await existing.edit({ embeds: [embed], content: '' })
+        return
+      }
+    }
+
+    const sent = await modChannel.send({ embeds: [embed] })
+    verificationLogMessageId = sent.id
+  } catch (err) {
+    console.error('Failed to post verification action log:', err?.message || err)
+  }
+}
+
+function getOwnedVoiceChannelForUser(userId, guild) {
+  const channelId = userOwnedTempChannels.get(userId)
+  if (!channelId) return null
+  return guild.channels.cache.get(channelId) || null
+}
+
+function getVoiceControlChannel(member) {
+  const channel = member.voice.channel
+  if (!channel) return { error: '❌ You need to be inside your temp voice channel first.' }
+
+  const ownerId = tempVoiceOwners.get(channel.id)
+  if (!ownerId) return { error: '❌ This is not a managed VoiceMaster channel.' }
+
+  if (ownerId !== member.id) {
+    return { error: '❌ You only control the temp voice channel you own.' }
+  }
+
+  return { channel }
+}
+
+async function ensureVoiceMasterPanel() {
+  try {
+    const menuChannel = client.channels.cache.get(VOICEMASTER_MENU_CHANNEL)
+      || await client.channels.fetch(VOICEMASTER_MENU_CHANNEL).catch(() => null)
+
+    if (!menuChannel || !menuChannel.isTextBased()) {
+      console.error('VoiceMaster menu channel missing or not text based.')
+      return
+    }
+
+    const recent = await menuChannel.messages.fetch({ limit: 20 }).catch(() => null)
+    const oldPanels = recent
+      ? recent.filter(m => m.author.id === client.user.id && m.embeds.some(e => e.title === '🔊 VoiceMaster'))
+      : null
+
+    if (oldPanels && oldPanels.size) {
+      for (const [, msg] of oldPanels) {
+        await msg.delete().catch(() => {})
+      }
+    }
+
+    await menuChannel.send({
+      embeds: [buildVoiceMasterPanelEmbed()],
+      components: buildVoiceMasterRows()
+    })
+  } catch (err) {
+    console.error('Failed to set up VoiceMaster panel:', err?.message || err)
+  }
+}
+
+async function createTempVoiceChannel(member) {
+  try {
+    const existing = getOwnedVoiceChannelForUser(member.id, member.guild)
+    if (existing) {
+      await member.voice.setChannel(existing).catch(() => {})
+      return
+    }
+
+    const createChannel = member.guild.channels.cache.get(VOICEMASTER_CREATE_CHANNEL)
+      || await member.guild.channels.fetch(VOICEMASTER_CREATE_CHANNEL).catch(() => null)
+
+    if (!createChannel || createChannel.type !== ChannelType.GuildVoice) {
+      console.error('VoiceMaster create channel missing or not a voice channel.')
+      return
+    }
+
+    const safeName = member.user.username.replace(/[^\w\s'-]/g, '').trim() || member.user.username
+    const channelName = `${safeName}'s room`
+
+    const newChannel = await member.guild.channels.create({
+      name: channelName,
+      type: ChannelType.GuildVoice,
+      parent: createChannel.parentId || null,
+      bitrate: createChannel.bitrate || 64000,
+      userLimit: 0,
+      permissionOverwrites: [
+        {
+          id: member.guild.roles.everyone.id,
+          allow: [
+            PermissionFlagsBits.Connect,
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.Speak
+          ]
+        },
+        {
+          id: member.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.Connect,
+            PermissionFlagsBits.Speak,
+            PermissionFlagsBits.Stream,
+            PermissionFlagsBits.UseVAD,
+            PermissionFlagsBits.MoveMembers,
+            PermissionFlagsBits.MuteMembers,
+            PermissionFlagsBits.DeafenMembers,
+            PermissionFlagsBits.ManageChannels
+          ]
+        }
+      ]
+    }).catch(err => {
+      console.error('Failed to create temp voice channel:', err?.message || err)
+      return null
+    })
+
+    if (!newChannel) return
+
+    tempVoiceOwners.set(newChannel.id, member.id)
+    userOwnedTempChannels.set(member.id, newChannel.id)
+
+    await member.voice.setChannel(newChannel).catch(err => {
+      console.error('Failed to move member into temp voice channel:', err?.message || err)
+    })
+  } catch (err) {
+    console.error('createTempVoiceChannel error:', err?.message || err)
+  }
+}
+
+async function cleanupTempVoiceChannel(channel) {
+  try {
+    if (!channel) return
+    if (!tempVoiceOwners.has(channel.id)) return
+    if (channel.members.size > 0) return
+
+    const ownerId = tempVoiceOwners.get(channel.id)
+    tempVoiceOwners.delete(channel.id)
+
+    if (ownerId && userOwnedTempChannels.get(ownerId) === channel.id) {
+      userOwnedTempChannels.delete(ownerId)
+    }
+
+    await channel.delete('VoiceMaster temp channel empty').catch(err => {
+      console.error('Failed to delete temp voice channel:', err?.message || err)
+    })
+  } catch (err) {
+    console.error('cleanupTempVoiceChannel error:', err?.message || err)
+  }
+}
+
 client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`)
 
@@ -557,18 +884,27 @@ client.once('clientReady', async () => {
       return
     }
 
-    const recent = await modChannel.messages.fetch({ limit: 20 }).catch(() => null)
-    const existing = recent
+    const recent = await modChannel.messages.fetch({ limit: 25 }).catch(() => null)
+
+    const existingDashboard = recent
       ? recent.find(m => m.author.id === client.user.id && (m.embeds.some(e => e.title?.includes('Verification Dashboard')) || m.content === 'Loading verification dashboard...'))
       : null
 
-    if (existing) {
-      queueMessageId = existing.id
+    const existingLog = recent
+      ? recent.find(m => m.author.id === client.user.id && m.embeds.some(e => e.title?.includes('Latest Verification Action')))
+      : null
+
+    if (existingDashboard) {
+      queueMessageId = existingDashboard.id
       console.log('Recovered existing dashboard message.')
     } else {
       const msg = await modChannel.send({ content: 'Loading verification dashboard...' })
       queueMessageId = msg.id
       console.log('Created new dashboard message.')
+    }
+
+    if (existingLog) {
+      verificationLogMessageId = existingLog.id
     }
 
     if (!dashboardStarted) {
@@ -587,6 +923,23 @@ client.on('guildMemberAdd', async member => {
   await sendWelcomeEmbed(member)
 })
 
+client.on('voiceStateUpdate', async (oldState, newState) => {
+  try {
+    if (!newState.member || newState.member.user.bot) return
+
+    if (newState.channelId === VOICEMASTER_CREATE_CHANNEL) {
+      await createTempVoiceChannel(newState.member)
+      return
+    }
+
+    if (oldState.channel && oldState.channel.id !== newState.channelId) {
+      await cleanupTempVoiceChannel(oldState.channel)
+    }
+  } catch (err) {
+    console.error('voiceStateUpdate error:', err?.message || err)
+  }
+})
+
 client.on('messageCreate', async message => {
   if (message.author.bot) return
   if (processedMessages.has(message.id)) return
@@ -600,7 +953,10 @@ client.on('messageCreate', async message => {
   const cmd = args[0].toLowerCase()
 
   if (cmd === '%help') {
-    return await message.channel.send({ embeds: [buildHelpEmbed()] })
+    return await message.channel.send({
+      embeds: [buildHelpHomeEmbed()],
+      components: buildHelpComponents(message.guild?.id)
+    })
   }
 
   if (cmd === '!setup') {
@@ -617,6 +973,15 @@ client.on('messageCreate', async message => {
     })
   }
 
+  if (cmd === '!verify-refresh') {
+    if (!hasStaffAccess(message.member)) {
+      return await message.reply('❌ You do not have permission to use this command.')
+    }
+
+    await updateQueuePanel()
+    return await message.reply('✅ Verification dashboard refreshed.')
+  }
+
   if (cmd === '!ticket-setup') {
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
@@ -631,12 +996,18 @@ client.on('messageCreate', async message => {
     })
   }
 
+  if (cmd === '!voicemaster-setup') {
+    if (!hasStaffAccess(message.member)) {
+      return await message.reply('❌ You do not have permission to use this command.')
+    }
+
+    await ensureVoiceMasterPanel()
+    return await message.reply(`✅ VoiceMaster panel sent to <#${VOICEMASTER_MENU_CHANNEL}>.`)
+  }
+
   if (cmd === '!testwelcome') {
     const member = message.member
-    const hasStaffRole = STAFF_ROLE ? member?.roles.cache.has(STAFF_ROLE) : false
-    const hasManageGuild = member?.permissions.has(PermissionFlagsBits.ManageGuild)
-
-    if (!hasStaffRole && !hasManageGuild) {
+    if (!hasStaffAccess(member)) {
       return await message.reply('❌ You do not have permission to use this command.')
     }
 
@@ -882,7 +1253,7 @@ async function updateQueuePanel() {
     if (!modChannel || !modChannel.isTextBased()) return
 
     const guild = client.guilds.cache.first()
-    const visible = Array.from(requests.entries()).slice(0, 5)
+    const visible = Array.from(requests.entries()).slice(0, 4)
 
     for (const [userId, info] of visible) {
       const member = guild ? await guild.members.fetch(userId).catch(() => null) : null
@@ -897,6 +1268,15 @@ async function updateQueuePanel() {
 
     const embed = buildDashboardEmbed(visible)
     const components = []
+
+    components.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId('verify_refresh')
+          .setLabel('🔄 Refresh Pending')
+          .setStyle(ButtonStyle.Primary)
+      )
+    )
 
     for (const [userId, info] of visible) {
       if (info.status === 'pending') {
@@ -935,7 +1315,7 @@ async function updateQueuePanel() {
 
 const processingRequests = new Set()
 
-async function resolveRequest(userId, status, reason = null) {
+async function resolveRequest(userId, status, reason = null, moderatorTag = 'Unknown') {
   if (processingRequests.has(userId)) return
   processingRequests.add(userId)
 
@@ -946,7 +1326,7 @@ async function resolveRequest(userId, status, reason = null) {
     if (status === 'approved' && target) {
       await target.roles.add(VERIFIED_ROLE).catch(err => console.error(`Failed to add Verified role to ${userId}:`, err?.message))
       await target.roles.remove(UNVERIFIED_ROLE).catch(err => console.error(`Failed to remove Unverified role from ${userId}:`, err?.message))
-      await target.send('✅ Your verification has been **approved**. Welcome to the server — you now have the Verified role.').catch(() => {})
+      await target.send('✅ Your verification has been **approved**. Welcome to the server.').catch(() => {})
       console.log(`Approved verification for ${userId}`)
     }
 
@@ -963,6 +1343,7 @@ async function resolveRequest(userId, status, reason = null) {
     }
 
     await updateQueuePanel()
+    await postVerificationActionLog(userId, status, moderatorTag, reason)
 
     setTimeout(async () => {
       requests.delete(userId)
@@ -976,6 +1357,14 @@ async function resolveRequest(userId, status, reason = null) {
 }
 
 client.on('interactionCreate', async interaction => {
+  if (interaction.isStringSelectMenu() && interaction.customId === 'help_category_select') {
+    const value = interaction.values[0]
+    return await interaction.update({
+      embeds: [buildHelpCategoryEmbed(value)],
+      components: buildHelpComponents(interaction.guildId)
+    })
+  }
+
   if (interaction.type === InteractionType.ModalSubmit) {
     if (interaction.customId.startsWith('deny_modal_')) {
       const userId = interaction.customId.split('_')[2]
@@ -989,10 +1378,61 @@ client.on('interactionCreate', async interaction => {
 
       await interaction.deferReply({ ephemeral: true })
       const reason = interaction.fields.getTextInputValue('deny_reason')
-      await resolveRequest(userId, 'denied', reason)
+      await resolveRequest(userId, 'denied', reason, interaction.user.tag)
 
       return await interaction.editReply({
         content: `❌ Denied <@${userId}>${reason ? ` — reason: ${reason}` : ''}`
+      })
+    }
+
+    if (interaction.customId === 'vm_rename_modal') {
+      const member = interaction.guild.members.cache.get(interaction.user.id)
+      const result = getVoiceControlChannel(member)
+
+      if (result.error) {
+        return await interaction.reply({ content: result.error, ephemeral: true })
+      }
+
+      const newName = interaction.fields.getTextInputValue('vm_rename_input').trim().slice(0, 100)
+      if (!newName) {
+        return await interaction.reply({ content: '❌ Give the channel a real name.', ephemeral: true })
+      }
+
+      await result.channel.setName(newName).catch(err => {
+        console.error('Voice rename error:', err?.message || err)
+      })
+
+      return await interaction.reply({
+        content: `✅ Renamed your channel to **${newName}**.`,
+        ephemeral: true
+      })
+    }
+
+    if (interaction.customId === 'vm_limit_modal') {
+      const member = interaction.guild.members.cache.get(interaction.user.id)
+      const result = getVoiceControlChannel(member)
+
+      if (result.error) {
+        return await interaction.reply({ content: result.error, ephemeral: true })
+      }
+
+      const raw = interaction.fields.getTextInputValue('vm_limit_input').trim()
+      const limit = parseInt(raw, 10)
+
+      if (Number.isNaN(limit) || limit < 0 || limit > 99) {
+        return await interaction.reply({
+          content: '❌ Enter a number from 0 to 99.',
+          ephemeral: true
+        })
+      }
+
+      await result.channel.setUserLimit(limit).catch(err => {
+        console.error('Voice limit error:', err?.message || err)
+      })
+
+      return await interaction.reply({
+        content: `✅ User limit set to **${limit}**.`,
+        ephemeral: true
       })
     }
 
@@ -1000,6 +1440,21 @@ client.on('interactionCreate', async interaction => {
   }
 
   if (!interaction.isButton()) return
+
+  if (interaction.customId === 'verify_refresh') {
+    if (!hasStaffAccess(interaction.member)) {
+      return await interaction.reply({
+        content: '❌ You do not have permission to do that.',
+        ephemeral: true
+      })
+    }
+
+    await updateQueuePanel()
+    return await interaction.reply({
+      content: '✅ Verification dashboard refreshed.',
+      ephemeral: true
+    })
+  }
 
   if (interaction.customId === 'start_verify') {
     if (!interaction.user.avatar) {
@@ -1078,8 +1533,8 @@ client.on('interactionCreate', async interaction => {
       })
     }
 
-    await interaction.deferReply({ ephemeral: false })
-    await resolveRequest(userId, 'approved')
+    await interaction.deferReply({ ephemeral: true })
+    await resolveRequest(userId, 'approved', null, interaction.user.tag)
 
     return await interaction.editReply({
       content: `✅ <@${userId}> has been approved and given the Verified role.`
@@ -1187,9 +1642,7 @@ client.on('interactionCreate', async interaction => {
   if (interaction.customId.startsWith('close_ticket_')) {
     const ticketOwnerId = interaction.customId.split('_')[2]
     const member = interaction.guild.members.cache.get(interaction.user.id)
-    const isStaff = STAFF_ROLE
-      ? member?.roles.cache.has(STAFF_ROLE)
-      : member?.permissions.has(PermissionFlagsBits.ManageChannels)
+    const isStaff = hasStaffAccess(member)
 
     if (interaction.user.id !== ticketOwnerId && !isStaff) {
       return await interaction.reply({
@@ -1239,11 +1692,191 @@ client.on('interactionCreate', async interaction => {
         console.error('Failed to delete ticket channel:', err?.message || err)
       })
     }, 1500)
+
+    return
   }
 
   if (interaction.customId === 'cancel_close') {
     return await interaction.reply({
       content: '✅ Close cancelled.',
+      ephemeral: true
+    })
+  }
+
+  if (interaction.customId === 'vm_rename') {
+    const member = interaction.guild.members.cache.get(interaction.user.id)
+    const result = getVoiceControlChannel(member)
+
+    if (result.error) {
+      return await interaction.reply({ content: result.error, ephemeral: true })
+    }
+
+    const modal = new ModalBuilder()
+      .setCustomId('vm_rename_modal')
+      .setTitle('Rename Voice Channel')
+
+    const input = new TextInputBuilder()
+      .setCustomId('vm_rename_input')
+      .setLabel('New channel name')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setMaxLength(100)
+
+    modal.addComponents(new ActionRowBuilder().addComponents(input))
+    return await interaction.showModal(modal)
+  }
+
+  if (interaction.customId === 'vm_limit') {
+    const member = interaction.guild.members.cache.get(interaction.user.id)
+    const result = getVoiceControlChannel(member)
+
+    if (result.error) {
+      return await interaction.reply({ content: result.error, ephemeral: true })
+    }
+
+    const modal = new ModalBuilder()
+      .setCustomId('vm_limit_modal')
+      .setTitle('Set Voice Limit')
+
+    const input = new TextInputBuilder()
+      .setCustomId('vm_limit_input')
+      .setLabel('Enter a number from 0 to 99')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setMaxLength(2)
+
+    modal.addComponents(new ActionRowBuilder().addComponents(input))
+    return await interaction.showModal(modal)
+  }
+
+  if (interaction.customId === 'vm_lock') {
+    const member = interaction.guild.members.cache.get(interaction.user.id)
+    const result = getVoiceControlChannel(member)
+
+    if (result.error) {
+      return await interaction.reply({ content: result.error, ephemeral: true })
+    }
+
+    await result.channel.permissionOverwrites.edit(interaction.guild.roles.everyone.id, {
+      Connect: false
+    }).catch(err => console.error('vm lock error:', err?.message || err))
+
+    return await interaction.reply({
+      content: '✅ Your voice channel is now locked.',
+      ephemeral: true
+    })
+  }
+
+  if (interaction.customId === 'vm_unlock') {
+    const member = interaction.guild.members.cache.get(interaction.user.id)
+    const result = getVoiceControlChannel(member)
+
+    if (result.error) {
+      return await interaction.reply({ content: result.error, ephemeral: true })
+    }
+
+    await result.channel.permissionOverwrites.edit(interaction.guild.roles.everyone.id, {
+      Connect: null
+    }).catch(err => console.error('vm unlock error:', err?.message || err))
+
+    return await interaction.reply({
+      content: '✅ Your voice channel is now unlocked.',
+      ephemeral: true
+    })
+  }
+
+  if (interaction.customId === 'vm_hide') {
+    const member = interaction.guild.members.cache.get(interaction.user.id)
+    const result = getVoiceControlChannel(member)
+
+    if (result.error) {
+      return await interaction.reply({ content: result.error, ephemeral: true })
+    }
+
+    await result.channel.permissionOverwrites.edit(interaction.guild.roles.everyone.id, {
+      ViewChannel: false
+    }).catch(err => console.error('vm hide error:', err?.message || err))
+
+    return await interaction.reply({
+      content: '✅ Your voice channel is now hidden.',
+      ephemeral: true
+    })
+  }
+
+  if (interaction.customId === 'vm_show') {
+    const member = interaction.guild.members.cache.get(interaction.user.id)
+    const result = getVoiceControlChannel(member)
+
+    if (result.error) {
+      return await interaction.reply({ content: result.error, ephemeral: true })
+    }
+
+    await result.channel.permissionOverwrites.edit(interaction.guild.roles.everyone.id, {
+      ViewChannel: null
+    }).catch(err => console.error('vm show error:', err?.message || err))
+
+    return await interaction.reply({
+      content: '✅ Your voice channel is visible again.',
+      ephemeral: true
+    })
+  }
+
+  if (interaction.customId === 'vm_claim') {
+    const member = interaction.guild.members.cache.get(interaction.user.id)
+    const channel = member.voice.channel
+
+    if (!channel) {
+      return await interaction.reply({
+        content: '❌ Join a temp voice channel first.',
+        ephemeral: true
+      })
+    }
+
+    const ownerId = tempVoiceOwners.get(channel.id)
+    if (!ownerId) {
+      return await interaction.reply({
+        content: '❌ This is not a managed VoiceMaster channel.',
+        ephemeral: true
+      })
+    }
+
+    if (ownerId === interaction.user.id) {
+      return await interaction.reply({
+        content: '❌ You already own this voice channel.',
+        ephemeral: true
+      })
+    }
+
+    const oldOwnerStillHere = channel.members.has(ownerId)
+    if (oldOwnerStillHere) {
+      return await interaction.reply({
+        content: '❌ You can only claim a channel if the owner has left.',
+        ephemeral: true
+      })
+    }
+
+    const oldOwned = userOwnedTempChannels.get(ownerId)
+    if (oldOwned === channel.id) {
+      userOwnedTempChannels.delete(ownerId)
+    }
+
+    tempVoiceOwners.set(channel.id, interaction.user.id)
+    userOwnedTempChannels.set(interaction.user.id, channel.id)
+
+    await channel.permissionOverwrites.edit(interaction.user.id, {
+      ViewChannel: true,
+      Connect: true,
+      Speak: true,
+      Stream: true,
+      UseVAD: true,
+      MoveMembers: true,
+      MuteMembers: true,
+      DeafenMembers: true,
+      ManageChannels: true
+    }).catch(err => console.error('vm claim error:', err?.message || err))
+
+    return await interaction.reply({
+      content: '✅ You now own this voice channel.',
       ephemeral: true
     })
   }
