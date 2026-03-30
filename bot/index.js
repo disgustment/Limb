@@ -480,7 +480,7 @@ function buildWelcomeEmbed(member) {
       `hey **${member.user.username}**, welcome to **Limb** \n\n` +
       `> 🎫 support: <#${TICKET_PANEL_CHANNEL}>\n` +
       `> 📜 rules: <#${RULES_CHANNEL}>\n\n` +
-      'enjoy your stay at Limb, have fun, and make yourself at home :3'
+      'Enjoy your stay at Limb, have fun, and make yourself at home!'
     )
     .setFooter({ text: 'Limb • Welcome' })
     .setTimestamp()
