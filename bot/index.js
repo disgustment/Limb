@@ -40,6 +40,7 @@ const TICKET_CATEGORY = '1474929234664231073'
 const TICKET_PANEL_CHANNEL = '1487956293736988753'
 const WELCOME_CHANNEL = '1487993335519117465'
 const RULES_CHANNEL = '1474932410763186306'
+const VERIFY_CHANNEL = '1487211537335849081'
 
 const REFRESH_INTERVAL = 10000
 const MESSAGE_CACHE_TTL = 15000
@@ -480,6 +481,8 @@ function buildWelcomeEmbed(member) {
       `Hey **${member.user.username}**, welcome to **Limb** \n\n` +
       `> <#${TICKET_PANEL_CHANNEL}>\n` +
       `> <#${RULES_CHANNEL}>\n\n` +
+      `> <#${VERIFY_CHANNEL}>\n\n` +
+      
       'Enjoy your stay at Limb, have fun, and make yourself at home!'
     )
     .setFooter({ text: 'Limb • Welcome' })
