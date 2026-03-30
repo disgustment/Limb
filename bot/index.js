@@ -1,3 +1,4 @@
+So, the permissions in the Voicemaster are not the same as the ones in my create, so people who are unverified can see the channels. I'd like a fix to that and please don't mess with my Enter embed! You changed it to something else than what I put. Everything is nice, I'd just like it if my %help panel was a cooler looking and less all over the place. Also I'd like a moderation setup command that allows me to make the verify dashboard reappear as long as the latest verification actions just incase. I'd also like a revamped to provide a better look on the embeds and that's pretty much all. DON'T CHANGE ANYTHING LIKE YOU DID BEFORE WITH MY ENTER EMBED! Here's the index.js code, please automatically do it for me, I don't want to put it in manually : 
 const fs = require('fs')
 const path = require('path')
 const http = require('http')
@@ -610,10 +611,10 @@ function buildWelcomeEmbed(member) {
     .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }))
     .setDescription(
       `hey **${member.user.username}**, welcome to **Limb**\n\n` +
-      `> 🎫 support: <#${TICKET_PANEL_CHANNEL}>\n` +
-      `> 📜 rules: <#${RULES_CHANNEL}>\n` +
-      `> ✅ verify: <#${VERIFY_CHANNEL}>\n\n` +
-      'enjoy your stay at Limb and make yourself at home :3'
+      `> support: <#${TICKET_PANEL_CHANNEL}>\n` +
+      `> rules: <#${RULES_CHANNEL}>\n` +
+      `> verify: <#${VERIFY_CHANNEL}>\n\n` +
+      'Enjoy your stay at Limb and make yourself at home..'
     )
     .setFooter({ text: 'Limb • Welcome' })
     .setTimestamp()
