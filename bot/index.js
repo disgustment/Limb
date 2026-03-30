@@ -717,105 +717,38 @@ function buildDashboardComponents(page, pageCount, visible) {
   return rows
 }
 
-async function sendWelcomeEmbed(member) {
-  try {
-    const channel = member.guild.channels.cache.get(WELCOME_CHANNEL)
-      || await member.guild.channels.fetch(WELCOME_CHANNEL).catch(() => null)
+function getManagedOwnerOverwrite(channel) {
+  if (!channel || channel.type !== ChannelType.GuildVoice) return null
 
-    if (!channel || !channel.isTextBased()) {
-      console.error(`Welcome channel ${WELCOME_CHANNEL} not found or not text based.`)
-      return
-    }
+  return channel.permissionOverwrites.cache.find(ow => {
+    const isSpecial =
+      ow.id === channel.guild.roles.everyone.id ||
+      ow.id === VERIFIED_ROLE ||
+      ow.id === UNVERIFIED_ROLE ||
+      ow.id === STAFF_ROLE
 
-    await channel.send({
-      embeds: [buildWelcomeEmbed(member)]
-    })
-  } catch (err) {
-    console.error('Failed to send welcome embed:', err?.message || err)
-  }
+    if (isSpecial) return false
+
+    return ow.allow.has(PermissionFlagsBits.ManageChannels)
+  }) || null
 }
 
-async function buildGeminiReply(userId, input) {
-  if (!gemini) return null
+function recoverTempChannelOwnerId(channel) {
+  if (!channel || channel.type !== ChannelType.GuildVoice) return null
 
-  const memory = getMemory(userId)
-  const historyText = memory
-    .map(entry => `${entry.role === 'user' ? 'User' : 'Bot'}: ${entry.content}`)
-    .join('\n')
+  const cachedOwnerId = tempVoiceOwners.get(channel.id)
+  if (cachedOwnerId) return cachedOwnerId
 
-  const prompt = [
-    'You are Limb Bot in a Discord server.',
-    'Your personality is cute, warm, playful, affectionate, and a little teasing in a harmless way.',
-    'Type like a real online girl texting casually.',
-    'Use lowercase most of the time.',
-    'Use soft internet style sometimes, like "ngl", "idk", "tbh", "pls", "rn", and ":3" when it fits naturally.',
-    'Do not overdo ":3". Use it lightly.',
-    'Do not sound robotic, formal, or scripted.',
-    'Be emotionally aware and make your replies actually fit what the user said.',
-    'Be sweet when the user is vulnerable.',
-    'Be playful when the mood is light.',
-    'Be serious when the topic is serious.',
-    'Keep most replies between 1 and 4 sentences unless the user asks for more.',
-    'Do not mention ai, prompts, system instructions, or safety policy.',
-    'Do not be sexual.',
-    '',
-    historyText,
-    '',
-    `User: ${input}`,
-    'Bot:'
-  ].join('\n')
+  const ownerOverwrite = getManagedOwnerOverwrite(channel)
+  if (!ownerOverwrite) return null
 
-  const response = await gemini.models.generateContent({
-    model: 'gemini-2.5-flash',
-    contents: prompt
-  })
-
-  const text = response.text?.trim()
-  return text || null
+  tempVoiceOwners.set(channel.id, ownerOverwrite.id)
+  userOwnedTempChannels.set(ownerOverwrite.id, channel.id)
+  return ownerOverwrite.id
 }
 
-async function postVerificationActionLog(userId, status, moderatorTag, reason = null) {
-  try {
-    const modChannel = client.channels.cache.get(MOD_CHANNEL)
-      || await client.channels.fetch(MOD_CHANNEL).catch(() => null)
-
-    if (!modChannel || !modChannel.isTextBased()) return
-
-    const embed = buildVerificationLogEmbed(userId, status, reason, moderatorTag)
-
-    if (verificationLogMessageId) {
-      const existing = await modChannel.messages.fetch(verificationLogMessageId).catch(() => null)
-      if (existing) {
-        await existing.edit({ embeds: [embed], content: '' })
-        return
-      }
-    }
-
-    const sent = await modChannel.send({ embeds: [embed] })
-    verificationLogMessageId = sent.id
-  } catch (err) {
-    console.error('Failed to post verification action log:', err?.message || err)
-  }
-}
-
-function getOwnedVoiceChannelForUser(userId, guild) {
-  const channelId = userOwnedTempChannels.get(userId)
-  if (!channelId) return null
-  return guild.channels.cache.get(channelId) || null
-}
-
-function getVoiceControlChannel(member) {
-  const channel = member.voice.channel
-  if (!channel) return { error: '❌ You need to be inside your temp voice channel first.' }
-
-  const ownerId = tempVoiceOwners.get(channel.id)
-  if (!ownerId) return { error: '❌ This is not a managed VoiceMaster channel.' }
-
-  if (ownerId !== member.id) {
-    return { error: '❌ You only control the temp voice channel you own.' }
-  }
-
-  return { channel }
+function isManagedTempVoiceChannel(channel) {
+  return Boolean(recoverTempChannelOwnerId(channel))
 }
 
 async function ensureVoiceMasterCreateChannelPermissions() {
@@ -908,6 +841,13 @@ async function createTempVoiceChannel(member) {
           ]
         },
         {
+          id: UNVERIFIED_ROLE,
+          deny: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.Connect
+          ]
+        },
+        {
           id: VERIFIED_ROLE,
           allow: [
             PermissionFlagsBits.ViewChannel,
@@ -951,15 +891,17 @@ async function createTempVoiceChannel(member) {
 async function cleanupTempVoiceChannel(channel) {
   try {
     if (!channel) return
-    if (!tempVoiceOwners.has(channel.id)) return
+    if (channel.id === VOICEMASTER_CREATE_CHANNEL) return
+    if (channel.type !== ChannelType.GuildVoice) return
+    if (!isManagedTempVoiceChannel(channel)) return
     if (channel.members.size > 0) return
 
-    const ownerId = tempVoiceOwners.get(channel.id)
-    tempVoiceOwners.delete(channel.id)
-
+    const ownerId = recoverTempChannelOwnerId(channel)
     if (ownerId && userOwnedTempChannels.get(ownerId) === channel.id) {
       userOwnedTempChannels.delete(ownerId)
     }
+
+    tempVoiceOwners.delete(channel.id)
 
     await channel.delete('VoiceMaster temp channel empty').catch(err => {
       console.error('Failed to delete temp voice channel:', err?.message || err)
@@ -967,6 +909,15 @@ async function cleanupTempVoiceChannel(channel) {
   } catch (err) {
     console.error('cleanupTempVoiceChannel error:', err?.message || err)
   }
+}
+
+async function scheduleTempChannelCleanup(channel) {
+  if (!channel) return
+  setTimeout(() => {
+    cleanupTempVoiceChannel(channel).catch(err => {
+      console.error('scheduleTempChannelCleanup error:', err?.message || err)
+    })
+  }, 1500)
 }
 
 async function rebuildModerationPanel() {
@@ -1042,15 +993,18 @@ client.on('guildMemberAdd', async member => {
 
 client.on('voiceStateUpdate', async (oldState, newState) => {
   try {
-    if (!newState.member || newState.member.user.bot) return
+    if ((!oldState.member || oldState.member.user.bot) && (!newState.member || newState.member.user.bot)) return
 
     if (newState.channelId === VOICEMASTER_CREATE_CHANNEL) {
       await createTempVoiceChannel(newState.member)
-      return
     }
 
     if (oldState.channel && oldState.channel.id !== newState.channelId) {
-      await cleanupTempVoiceChannel(oldState.channel)
+      await scheduleTempChannelCleanup(oldState.channel)
+    }
+
+    if (newState.channel && newState.channel.id !== oldState.channelId && newState.channel.id !== VOICEMASTER_CREATE_CHANNEL) {
+      await scheduleTempChannelCleanup(newState.channel)
     }
   } catch (err) {
     console.error('voiceStateUpdate error:', err?.message || err)
@@ -1974,7 +1928,7 @@ client.on('interactionCreate', async interaction => {
       })
     }
 
-    const ownerId = tempVoiceOwners.get(channel.id)
+    const ownerId = recoverTempChannelOwnerId(channel)
     if (!ownerId) {
       return await interaction.reply({
         content: '❌ This is not a managed VoiceMaster channel.',
