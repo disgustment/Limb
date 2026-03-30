@@ -480,7 +480,7 @@ function buildWelcomeEmbed(member) {
     .setDescription(
       `Hey **${member.user.username}**, welcome to **Limb** \n\n` +
       `> <#${TICKET_PANEL_CHANNEL}>\n` +
-      `> <#${RULES_CHANNEL}>\n\n` +
+      `> <#${RULES_CHANNEL}>\n` +
       `> <#${VERIFY_CHANNEL}>\n\n` +
       
       'Enjoy your stay at Limb, have fun, and make yourself at home!'
