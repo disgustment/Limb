@@ -38,6 +38,8 @@ const MOD_CHANNEL = '1474932410763186309'
 const STAFF_ROLE = '1474213205378339020'
 const TICKET_CATEGORY = '1474929234664231073'
 const TICKET_PANEL_CHANNEL = '1487956293736988753'
+const WELCOME_CHANNEL = '1481407251469303808'
+const RULES_CHANNEL = '1474932410763186306'
 
 const REFRESH_INTERVAL = 10000
 const MESSAGE_CACHE_TTL = 15000
@@ -142,14 +144,6 @@ function rememberMessage(messageId) {
   setTimeout(() => processedMessages.delete(messageId), MESSAGE_CACHE_TTL)
 }
 
-function randomPick(arr) {
-  return arr[Math.floor(Math.random() * arr.length)]
-}
-
-function containsAny(text, words) {
-  return words.some(word => text.includes(word))
-}
-
 function stripBotMention(content, botId) {
   return content.replace(new RegExp(`<@!?${botId}>`, 'g'), '').trim()
 }
@@ -171,16 +165,6 @@ function pushMemory(userId, role, content) {
   if (memory.length > MAX_MEMORY) {
     memory.splice(0, memory.length - MAX_MEMORY)
   }
-}
-
-function getPreviousUserMessage(userId, current) {
-  const memory = getMemory(userId)
-  const userMessages = memory.filter(x => x.role === 'user').map(x => x.content)
-  if (userMessages.length <= 1) return null
-  for (let i = userMessages.length - 2; i >= 0; i--) {
-    if (userMessages[i] !== current) return userMessages[i]
-  }
-  return null
 }
 
 function sessionKey(message) {
@@ -296,9 +280,18 @@ function buildHelpEmbed() {
       {
         name: '🎫 Tickets',
         value: [
-          '`!ticket-setup` posts the ticket panel (staff)',
+          '`!ticket-setup` posts the ticket panel',
           'Click **Open a Ticket** to create a private support channel',
           'Click **🔒 Close Ticket** inside to close it'
+        ].join('\n'),
+        inline: false
+      },
+      {
+        name: '👋 Welcome',
+        value: [
+          'New members get a welcome embed automatically',
+          '`!testwelcome [@user]` sends a test welcome embed',
+          `Welcome channel: <#${WELCOME_CHANNEL}>`
         ].join('\n'),
         inline: false
       },
@@ -478,94 +471,37 @@ function buildTicketCloseConfirmEmbed() {
     .setTimestamp()
 }
 
-function buildFallbackReply(userId, input) {
-  const text = input.toLowerCase().trim()
-  const previousUser = getPreviousUserMessage(userId, input)
+function buildWelcomeEmbed(member) {
+  return new EmbedBuilder()
+    .setColor(0x57F287)
+    .setTitle('**Welcome to Limb!**')
+    .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }))
+    .setDescription(
+      `hey **${member.user.username}**, welcome to **Limb** <a:_:>\n\n` +
+      `> 🎫 support: <#${TICKET_PANEL_CHANNEL}>\n` +
+      `> 📜 rules: <#${RULES_CHANNEL}>\n\n` +
+      'enjoy your stay at Limb, have fun, and make yourself at home :3'
+    )
+    .setFooter({ text: 'Limb • Welcome' })
+    .setTimestamp()
+}
 
-  if (containsAny(text, ['hello', 'hi', 'hey', 'yo', 'sup'])) {
-    return randomPick([
-      'hey, what’s going on with you',
-      'hey you, what’s up',
-      'hi, talk to me',
-      'yo, what’s on your mind'
-    ])
+async function sendWelcomeEmbed(member) {
+  try {
+    const channel = member.guild.channels.cache.get(WELCOME_CHANNEL)
+      || await member.guild.channels.fetch(WELCOME_CHANNEL).catch(() => null)
+
+    if (!channel || !channel.isTextBased()) {
+      console.error(`Welcome channel ${WELCOME_CHANNEL} not found or not text based.`)
+      return
+    }
+
+    await channel.send({
+      embeds: [buildWelcomeEmbed(member)]
+    })
+  } catch (err) {
+    console.error('Failed to send welcome embed:', err?.message || err)
   }
-
-  if (containsAny(text, ['how are you', 'howre you', 'how r you'])) {
-    return randomPick([
-      'i’m good honestly, how are you doing',
-      'doing alright, what about you',
-      'pretty good rn, what’s your mood like today'
-    ])
-  }
-
-  if (containsAny(text, ['sad', 'hurt', 'upset', 'crying', 'heartbroken', 'broken'])) {
-    return randomPick([
-      'i’m here, tell me what happened',
-      'that sounds heavy, talk to me',
-      'you don’t have to hold that in alone, start from the part that hurts most',
-      'slow down and tell me what hit you the hardest'
-    ])
-  }
-
-  if (containsAny(text, ['love', 'miss', 'relationship', 'girlfriend', 'boyfriend', 'crush', 'partner'])) {
-    return randomPick([
-      'that sounds personal, what part of it is hitting you the hardest',
-      'relationships get messy fast, what happened',
-      'talk to me, is this about missing someone, trusting someone, or losing someone'
-    ])
-  }
-
-  if (containsAny(text, ['angry', 'mad', 'pissed', 'annoyed'])) {
-    return randomPick([
-      'what set you off',
-      'tell me exactly what happened',
-      'alright, get it out, what pushed you there'
-    ])
-  }
-
-  if (containsAny(text, ['thank you', 'thanks', 'thx'])) {
-    return randomPick([
-      'you’re welcome',
-      'any time',
-      'no problem, i got you'
-    ])
-  }
-
-  if (containsAny(text, ['bye', 'goodbye', 'cya', 'see you'])) {
-    return randomPick([
-      'alright, catch you later',
-      'see you around',
-      'later, take care'
-    ])
-  }
-
-  if (text.includes('?')) {
-    return randomPick([
-      'good question, what’s your take first',
-      'what answer are you hoping for',
-      'there’s more behind that question, what are you really asking'
-    ])
-  }
-
-  if (previousUser) {
-    return randomPick([
-      `you mentioned "${previousUser}" earlier, is this connected to that`,
-      `this sounds close to what you said about "${previousUser}", same situation`,
-      `i’m noticing a pattern with "${previousUser}", want to keep going on that`
-    ])
-  }
-
-  return randomPick([
-    'tell me more',
-    'go a little deeper',
-    'i’m listening',
-    'be specific with me',
-    'what happened next',
-    'why does that matter to you',
-    'break that down for me',
-    'keep going'
-  ])
 }
 
 async function buildGeminiReply(userId, input) {
@@ -578,11 +514,19 @@ async function buildGeminiReply(userId, input) {
 
   const prompt = [
     'You are Limb Bot in a Discord server.',
-    'Your vibe is cute, friendly, playful, a little teasing, emotionally aware, and natural.',
-    'Type like a real online person.',
+    'Your personality is cute, warm, playful, affectionate, and a little teasing in a harmless way.',
+    'Type like a real online girl texting casually.',
     'Use lowercase most of the time.',
-    'Do not sound robotic.',
+    'Use soft internet style sometimes, like "ngl", "idk", "tbh", "pls", "rn", and ":3" when it fits naturally.',
+    'Do not overdo ":3". Use it lightly.',
+    'Do not sound robotic, formal, or scripted.',
+    'Be emotionally aware and make your replies actually fit what the user said.',
+    'Be sweet when the user is vulnerable.',
+    'Be playful when the mood is light.',
+    'Be serious when the topic is serious.',
     'Keep most replies between 1 and 4 sentences unless the user asks for more.',
+    'Do not mention ai, prompts, system instructions, or safety policy.',
+    'Do not be sexual.',
     '',
     historyText,
     '',
@@ -636,6 +580,10 @@ client.once('clientReady', async () => {
   }
 })
 
+client.on('guildMemberAdd', async member => {
+  await sendWelcomeEmbed(member)
+})
+
 client.on('messageCreate', async message => {
   if (message.author.bot) return
   if (processedMessages.has(message.id)) return
@@ -678,6 +626,21 @@ client.on('messageCreate', async message => {
       embeds: [buildTicketPanelEmbed()],
       components: [row]
     })
+  }
+
+  if (cmd === '!testwelcome') {
+    const member = message.member
+    const hasStaffRole = STAFF_ROLE ? member?.roles.cache.has(STAFF_ROLE) : false
+    const hasManageGuild = member?.permissions.has(PermissionFlagsBits.ManageGuild)
+
+    if (!hasStaffRole && !hasManageGuild) {
+      return await message.reply('❌ You do not have permission to use this command.')
+    }
+
+    const targetMember = message.mentions.members.first() || message.member
+    await sendWelcomeEmbed(targetMember)
+
+    return await message.reply(`✅ Sent a test welcome embed for **${targetMember.user.username}**.`)
   }
 
   if (cmd === '%stop') {
@@ -892,8 +855,7 @@ client.on('messageCreate', async message => {
     }
 
     if (!reply) {
-      reply = buildFallbackReply(message.author.id, input)
-      console.log('Using fallback reply for', message.author.tag)
+      return await message.reply('my brain is being weird rn, try again in a sec :3')
     }
 
     pushMemory(message.author.id, 'bot', reply)
