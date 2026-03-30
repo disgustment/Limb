@@ -1,4 +1,3 @@
-So, the permissions in the Voicemaster are not the same as the ones in my create, so people who are unverified can see the channels. I'd like a fix to that and please don't mess with my Enter embed! You changed it to something else than what I put. Everything is nice, I'd just like it if my %help panel was a cooler looking and less all over the place. Also I'd like a moderation setup command that allows me to make the verify dashboard reappear as long as the latest verification actions just incase. I'd also like a revamped to provide a better look on the embeds and that's pretty much all. DON'T CHANGE ANYTHING LIKE YOU DID BEFORE WITH MY ENTER EMBED! Here's the index.js code, please automatically do it for me, I don't want to put it in manually : 
 const fs = require('fs')
 const path = require('path')
 const http = require('http')
@@ -50,6 +49,7 @@ const REFRESH_INTERVAL = 10000
 const MESSAGE_CACHE_TTL = 15000
 const CHAT_SESSION_MS = 15 * 60 * 1000
 const MAX_MEMORY = 16
+const DASHBOARD_PAGE_SIZE = 4
 
 const gemini = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null
 
@@ -65,6 +65,7 @@ let queueMessageId = null
 let dashboardStarted = false
 let dashboardUpdating = false
 let verificationLogMessageId = null
+let dashboardPage = 0
 
 const LOCK_FILE = path.join('/tmp', 'limb-bot.lock')
 
@@ -258,44 +259,65 @@ function hasStaffAccess(member) {
   )
 }
 
+function getPendingRequestsArray() {
+  return Array.from(requests.entries()).filter(([, info]) => info.status === 'pending')
+}
+
+function getDashboardPageCount() {
+  return Math.max(1, Math.ceil(getPendingRequestsArray().length / DASHBOARD_PAGE_SIZE))
+}
+
+function clampDashboardPage() {
+  const pageCount = getDashboardPageCount()
+  if (dashboardPage < 0) dashboardPage = 0
+  if (dashboardPage > pageCount - 1) dashboardPage = pageCount - 1
+}
+
 function buildHelpHomeEmbed() {
   return new EmbedBuilder()
-    .setColor(0x00FFFF)
+    .setColor(0x00E5FF)
     .setTitle('Limb Bot')
-    .setDescription('clean setup, smooth systems, and the stuff you actually need')
+    .setDescription(
+      'use the menu below to navigate commands\n\n' +
+      '**core systems**\n' +
+      'moderation, tickets, voicemaster\n\n' +
+      '**extras**\n' +
+      'economy, fun, utilities'
+    )
     .addFields(
       {
-        name: 'Categories',
+        name: 'main',
         value: [
-          'Moderation',
-          'Economy',
-          'Information',
-          'Fun',
-          'Config',
-          'Tickets',
-          'Voicemaster'
+          'moderation',
+          'tickets',
+          'voicemaster'
         ].join('\n'),
         inline: true
       },
       {
-        name: 'Quick Links',
+        name: 'other',
         value: [
-          `Support: <#${TICKET_PANEL_CHANNEL}>`,
-          `Rules: <#${RULES_CHANNEL}>`,
-          `Verify: <#${VERIFY_CHANNEL}>`
+          'economy',
+          'fun',
+          'information',
+          'config'
         ].join('\n'),
         inline: true
+      },
+      {
+        name: 'quick access',
+        value:
+          `support <#${TICKET_PANEL_CHANNEL}>\n` +
+          `rules <#${RULES_CHANNEL}>\n` +
+          `verify <#${VERIFY_CHANNEL}>`
       }
     )
-    .setFooter({ text: 'Select a category from the dropdown menu below' })
-    .setTimestamp()
+    .setFooter({ text: 'select a category below' })
 }
-
 function buildHelpCategoryEmbed(category) {
   const embed = new EmbedBuilder()
-    .setColor(0x00FFFF)
-    .setTimestamp()
-    .setFooter({ text: 'Select a category from the dropdown menu below' })
+    .setColor(0x00E5FF)
+    .setFooter({ text: 'select a category below' })
 
   if (category === 'moderation') {
     return embed
@@ -303,8 +325,8 @@ function buildHelpCategoryEmbed(category) {
       .setDescription([
         '`!setup` posts the verification panel',
         '`!verify-refresh` refreshes the verification dashboard',
-        'Use the dashboard buttons to view, approve, deny, and refresh',
-        'The dashboard now keeps one rolling action log instead of flooding the channel'
+        '`!mod-setup` rebuilds the dashboard and latest action log',
+        'use the dashboard buttons to view, approve, deny, refresh, and page through requests'
       ].join('\n'))
   }
 
@@ -328,8 +350,8 @@ function buildHelpCategoryEmbed(category) {
       .setDescription([
         '`%help` opens this help menu',
         '`!testwelcome [@user]` sends a welcome test',
-        `Welcome channel: <#${WELCOME_CHANNEL}>`,
-        `Rules channel: <#${RULES_CHANNEL}>`
+        `welcome channel: <#${WELCOME_CHANNEL}>`,
+        `rules channel: <#${RULES_CHANNEL}>`
       ].join('\n'))
   }
 
@@ -340,7 +362,7 @@ function buildHelpCategoryEmbed(category) {
         '`%talk <message>` starts a conversation',
         '`@BotName <message>` also starts one',
         '`%stop` ends the current conversation',
-        'Reply to the bot to keep chatting'
+        'reply to the bot to keep chatting'
       ].join('\n'))
   }
 
@@ -351,7 +373,8 @@ function buildHelpCategoryEmbed(category) {
         '`!setup` verification setup',
         '`!ticket-setup` ticket setup',
         '`!voicemaster-setup` voicemaster setup',
-        '`!verify-refresh` dashboard refresh'
+        '`!verify-refresh` dashboard refresh',
+        '`!mod-setup` moderation system rebuild'
       ].join('\n'))
   }
 
@@ -360,9 +383,9 @@ function buildHelpCategoryEmbed(category) {
       .setTitle('Tickets')
       .setDescription([
         '`!ticket-setup` posts the support panel',
-        'Click **Open a Ticket** to create a private channel',
-        'Click **🔒 Close Ticket** inside to close it',
-        `Panel channel: <#${TICKET_PANEL_CHANNEL}>`
+        'click **Open a Ticket** to create a private channel',
+        'click **🔒 Close Ticket** inside to close it',
+        `panel channel: <#${TICKET_PANEL_CHANNEL}>`
       ].join('\n'))
   }
 
@@ -371,8 +394,8 @@ function buildHelpCategoryEmbed(category) {
       .setTitle('Voicemaster')
       .setDescription([
         '`!voicemaster-setup` posts the voice menu panel',
-        `Join <#${VOICEMASTER_CREATE_CHANNEL}> to create your own voice`,
-        'Use the menu buttons to rename, set limit, lock, unlock, hide, show, or claim'
+        `join <#${VOICEMASTER_CREATE_CHANNEL}> to create your own voice`,
+        'use the menu buttons to rename, set limit, lock, unlock, hide, show, or claim'
       ].join('\n'))
   }
 
@@ -506,36 +529,31 @@ function buildUserInfoEmbed(user, nickname, createdAt, joinedAt, roles, avatarUr
     .setTimestamp()
 }
 
-function buildDashboardEmbed(sortedRequests) {
-  const pendingCount = sortedRequests.filter(([, info]) => info.status === 'pending').length
-
+function buildDashboardEmbed(sortedRequests, page, pageCount, totalPending) {
   const embed = new EmbedBuilder()
-    .setColor(0x00FFFF)
-    .setTitle('🛡️ Verification Dashboard')
-    .setDescription(`Total pending requests: **${pendingCount}**`)
+    .setColor(0x00E5FF)
+    .setTitle('Verification Queue')
+    .setDescription(`pending: **${totalPending}**`)
     .addFields({
-      name: 'Quick Actions',
-      value: 'Use the refresh button below to reload the queue instantly.'
+      name: 'navigation',
+      value: `page **${page + 1}** of **${pageCount}**`
     })
-    .setFooter({ text: 'Limb Bot • Staff Dashboard' })
+    .setFooter({ text: 'use the buttons below to manage the queue' })
     .setTimestamp()
 
-  if (sortedRequests.length === 0) {
+  if (!sortedRequests.length) {
     embed.addFields({
-      name: 'Queue',
-      value: 'No pending verification requests.'
+      name: 'queue',
+      value: 'empty'
     })
     return embed
   }
 
-  for (let position = 0; position < sortedRequests.length; position++) {
-    const [, info] = sortedRequests[position]
-    const emoji = getStatusEmoji(info.status, position)
-
+  for (let i = 0; i < sortedRequests.length; i++) {
+    const [, info] = sortedRequests[i]
     embed.addFields({
-      name: `${emoji} #${position + 1} ${info.user.username}`,
-      value: info.summaryText || 'Loading user details...',
-      inline: false
+      name: `#${page * DASHBOARD_PAGE_SIZE + i + 1} ${info.user.username}`,
+      value: info.summaryText || 'loading...'
     })
   }
 
@@ -546,16 +564,17 @@ function buildVerificationLogEmbed(userId, status, reason = null, moderatorTag =
   const color = status === 'approved' ? 0x57F287 : 0xED4245
   const action = status === 'approved' ? 'Approved' : 'Denied'
 
+  const lines = [
+    userId === 'none' ? 'User: **none yet**' : `User: <@${userId}>`,
+    `Moderator: **${moderatorTag}**`
+  ]
+
+  if (reason) lines.push(`Reason: **${reason}**`)
+
   return new EmbedBuilder()
     .setColor(color)
     .setTitle(`Latest Verification Action • ${action}`)
-    .setDescription(
-      [
-        `User: <@${userId}>`,
-        `Moderator: **${moderatorTag}**`,
-        reason ? `Reason: **${reason}**` : null
-      ].filter(Boolean).join('\n')
-    )
+    .setDescription(lines.join('\n'))
     .setFooter({ text: 'Limb Bot • Verification Log' })
     .setTimestamp()
 }
@@ -626,12 +645,8 @@ function buildVoiceMasterPanelEmbed() {
     .setTitle('🔊 VoiceMaster')
     .setDescription(
       `join <#${VOICEMASTER_CREATE_CHANNEL}> to create your own voice channel.\n\n` +
-      '**controls:**\n' +
-      '• rename\n' +
-      '• limit\n' +
-      '• lock and unlock\n' +
-      '• hide and show\n' +
-      '• claim if the owner leaves\n\n' +
+      '**controls**\n' +
+      'rename, limit, lock, unlock, hide, show, claim\n\n' +
       'stand in your temp channel first, then use the buttons below.'
     )
     .setFooter({ text: 'Limb Bot • VoiceMaster' })
@@ -640,19 +655,65 @@ function buildVoiceMasterPanelEmbed() {
 
 function buildVoiceMasterRows() {
   const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('vm_rename').setLabel('✏️ Rename').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('vm_limit').setLabel('👥 Limit').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('vm_lock').setLabel('🔒 Lock').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('vm_unlock').setLabel('🔓 Unlock').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('vm_claim').setLabel('👑 Claim').setStyle(ButtonStyle.Success)
+    new ButtonBuilder().setCustomId('vm_rename').setLabel('Rename').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('vm_limit').setLabel('Limit').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('vm_claim').setLabel('Claim').setStyle(ButtonStyle.Success)
   )
 
   const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('vm_hide').setLabel('🙈 Hide').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('vm_show').setLabel('👀 Show').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId('vm_lock').setLabel('Lock').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('vm_unlock').setLabel('Unlock').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('vm_hide').setLabel('Hide').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('vm_show').setLabel('Show').setStyle(ButtonStyle.Secondary)
   )
 
   return [row1, row2]
+}
+
+function buildDashboardComponents(page, pageCount, visible) {
+  const rows = []
+
+  rows.push(
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('verify_prev')
+        .setLabel('⬅️ Prev')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(page <= 0),
+      new ButtonBuilder()
+        .setCustomId('verify_refresh')
+        .setLabel('🔄 Refresh')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId('verify_next')
+        .setLabel('Next ➡️')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(page >= pageCount - 1)
+    )
+  )
+
+  for (const [userId, info] of visible) {
+    if (info.status === 'pending') {
+      rows.push(
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`view_${userId}`)
+            .setLabel('View')
+            .setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder()
+            .setCustomId(`approve_${userId}`)
+            .setLabel('Approve')
+            .setStyle(ButtonStyle.Success),
+          new ButtonBuilder()
+            .setCustomId(`deny_${userId}`)
+            .setLabel('Deny')
+            .setStyle(ButtonStyle.Danger)
+        )
+      )
+    }
+  }
+
+  return rows
 }
 
 async function sendWelcomeEmbed(member) {
@@ -814,9 +875,16 @@ async function createTempVoiceChannel(member) {
       permissionOverwrites: [
         {
           id: member.guild.roles.everyone.id,
-          allow: [
-            PermissionFlagsBits.Connect,
+          deny: [
             PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.Connect
+          ]
+        },
+        {
+          id: VERIFIED_ROLE,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.Connect,
             PermissionFlagsBits.Speak
           ]
         },
@@ -874,6 +942,26 @@ async function cleanupTempVoiceChannel(channel) {
   }
 }
 
+async function rebuildModerationPanel() {
+  const modChannel = client.channels.cache.get(MOD_CHANNEL)
+    || await client.channels.fetch(MOD_CHANNEL).catch(() => null)
+
+  if (!modChannel || !modChannel.isTextBased()) {
+    throw new Error('mod channel not found')
+  }
+
+  const dashboardMessage = await modChannel.send({ content: 'Loading verification dashboard...' })
+  queueMessageId = dashboardMessage.id
+
+  const logMessage = await modChannel.send({
+    embeds: [buildVerificationLogEmbed('none', 'approved', null, 'system')]
+  })
+  verificationLogMessageId = logMessage.id
+
+  dashboardPage = 0
+  await updateQueuePanel()
+}
+
 client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`)
 
@@ -888,7 +976,7 @@ client.once('clientReady', async () => {
     const recent = await modChannel.messages.fetch({ limit: 25 }).catch(() => null)
 
     const existingDashboard = recent
-      ? recent.find(m => m.author.id === client.user.id && (m.embeds.some(e => e.title?.includes('Verification Dashboard')) || m.content === 'Loading verification dashboard...'))
+      ? recent.find(m => m.author.id === client.user.id && (m.embeds.some(e => e.title?.includes('Verification Queue')) || m.content === 'Loading verification dashboard...'))
       : null
 
     const existingLog = recent
@@ -981,6 +1069,15 @@ client.on('messageCreate', async message => {
 
     await updateQueuePanel()
     return await message.reply('✅ Verification dashboard refreshed.')
+  }
+
+  if (cmd === '!mod-setup') {
+    if (!hasStaffAccess(message.member)) {
+      return await message.reply('❌ no permission.')
+    }
+
+    await rebuildModerationPanel()
+    return await message.reply('✅ moderation system restored.')
   }
 
   if (cmd === '!ticket-setup') {
@@ -1254,7 +1351,14 @@ async function updateQueuePanel() {
     if (!modChannel || !modChannel.isTextBased()) return
 
     const guild = client.guilds.cache.first()
-    const visible = Array.from(requests.entries()).slice(0, 4)
+    const pendingEntries = getPendingRequestsArray()
+    const totalPending = pendingEntries.length
+
+    clampDashboardPage()
+
+    const pageCount = getDashboardPageCount()
+    const start = dashboardPage * DASHBOARD_PAGE_SIZE
+    const visible = pendingEntries.slice(start, start + DASHBOARD_PAGE_SIZE)
 
     for (const [userId, info] of visible) {
       const member = guild ? await guild.members.fetch(userId).catch(() => null) : null
@@ -1264,41 +1368,11 @@ async function updateQueuePanel() {
       const roles = member
         ? member.roles.cache.map(r => r.name).filter(n => n !== '@everyone').join(', ') || 'None'
         : 'N/A'
-      info.summaryText = `**Nickname:** ${nickname}\n**Created:** ${createdAt}\n**Joined:** ${joinedAt}\n**Roles:** ${roles}\n**Status:** ${info.status}`
+      info.summaryText = `**Nickname:** ${nickname}\n**Created:** ${createdAt}\n**Joined:** ${joinedAt}\n**Roles:** ${roles}`
     }
 
-    const embed = buildDashboardEmbed(visible)
-    const components = []
-
-    components.push(
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId('verify_refresh')
-          .setLabel('🔄 Refresh Pending')
-          .setStyle(ButtonStyle.Primary)
-      )
-    )
-
-    for (const [userId, info] of visible) {
-      if (info.status === 'pending') {
-        components.push(
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-              .setCustomId(`view_${userId}`)
-              .setLabel('👁 View Info')
-              .setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder()
-              .setCustomId(`approve_${userId}`)
-              .setLabel('✅ Approve')
-              .setStyle(ButtonStyle.Success),
-            new ButtonBuilder()
-              .setCustomId(`deny_${userId}`)
-              .setLabel('❌ Deny')
-              .setStyle(ButtonStyle.Danger)
-          )
-        )
-      }
-    }
+    const embed = buildDashboardEmbed(visible, dashboardPage, pageCount, totalPending)
+    const components = buildDashboardComponents(dashboardPage, pageCount, visible)
 
     const msg = await modChannel.messages.fetch(queueMessageId).catch(() => null)
     if (!msg) {
@@ -1349,6 +1423,7 @@ async function resolveRequest(userId, status, reason = null, moderatorTag = 'Unk
     setTimeout(async () => {
       requests.delete(userId)
       processingRequests.delete(userId)
+      clampDashboardPage()
       await updateQueuePanel()
     }, 5000)
   } catch (err) {
@@ -1442,6 +1517,42 @@ client.on('interactionCreate', async interaction => {
 
   if (!interaction.isButton()) return
 
+  if (interaction.customId === 'verify_prev') {
+    if (!hasStaffAccess(interaction.member)) {
+      return await interaction.reply({
+        content: '❌ You do not have permission to do that.',
+        ephemeral: true
+      })
+    }
+
+    dashboardPage -= 1
+    clampDashboardPage()
+    await updateQueuePanel()
+
+    return await interaction.reply({
+      content: `✅ moved to page ${dashboardPage + 1}.`,
+      ephemeral: true
+    })
+  }
+
+  if (interaction.customId === 'verify_next') {
+    if (!hasStaffAccess(interaction.member)) {
+      return await interaction.reply({
+        content: '❌ You do not have permission to do that.',
+        ephemeral: true
+      })
+    }
+
+    dashboardPage += 1
+    clampDashboardPage()
+    await updateQueuePanel()
+
+    return await interaction.reply({
+      content: `✅ moved to page ${dashboardPage + 1}.`,
+      ephemeral: true
+    })
+  }
+
   if (interaction.customId === 'verify_refresh') {
     if (!hasStaffAccess(interaction.member)) {
       return await interaction.reply({
@@ -1480,6 +1591,7 @@ client.on('interactionCreate', async interaction => {
       status: 'pending'
     })
 
+    clampDashboardPage()
     await updateQueuePanel()
     await interaction.user.send('📋 Your verification request has been received. Staff will review it shortly.').catch(() => {})
 
@@ -1758,7 +1870,7 @@ client.on('interactionCreate', async interaction => {
       return await interaction.reply({ content: result.error, ephemeral: true })
     }
 
-    await result.channel.permissionOverwrites.edit(interaction.guild.roles.everyone.id, {
+    await result.channel.permissionOverwrites.edit(VERIFIED_ROLE, {
       Connect: false
     }).catch(err => console.error('vm lock error:', err?.message || err))
 
@@ -1776,8 +1888,8 @@ client.on('interactionCreate', async interaction => {
       return await interaction.reply({ content: result.error, ephemeral: true })
     }
 
-    await result.channel.permissionOverwrites.edit(interaction.guild.roles.everyone.id, {
-      Connect: null
+    await result.channel.permissionOverwrites.edit(VERIFIED_ROLE, {
+      Connect: true
     }).catch(err => console.error('vm unlock error:', err?.message || err))
 
     return await interaction.reply({
@@ -1794,7 +1906,7 @@ client.on('interactionCreate', async interaction => {
       return await interaction.reply({ content: result.error, ephemeral: true })
     }
 
-    await result.channel.permissionOverwrites.edit(interaction.guild.roles.everyone.id, {
+    await result.channel.permissionOverwrites.edit(VERIFIED_ROLE, {
       ViewChannel: false
     }).catch(err => console.error('vm hide error:', err?.message || err))
 
@@ -1812,8 +1924,8 @@ client.on('interactionCreate', async interaction => {
       return await interaction.reply({ content: result.error, ephemeral: true })
     }
 
-    await result.channel.permissionOverwrites.edit(interaction.guild.roles.everyone.id, {
-      ViewChannel: null
+    await result.channel.permissionOverwrites.edit(VERIFIED_ROLE, {
+      ViewChannel: true
     }).catch(err => console.error('vm show error:', err?.message || err))
 
     return await interaction.reply({
