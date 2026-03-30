@@ -43,7 +43,7 @@ const WELCOME_CHANNEL = '1487993335519117465'
 const RULES_CHANNEL = '1474932410763186306'
 const VERIFY_CHANNEL = '1487211537335849081'
 const VOICEMASTER_MENU_CHANNEL = '1488284084714209452'
-const VOICEMASTER_CREATE_CHANNEL = '1488286442080702625'
+const VOICEMASTER_CREATE_CHANNEL = '1488296010852729055'
 
 const REFRESH_INTERVAL = 10000
 const MESSAGE_CACHE_TTL = 15000
@@ -158,12 +158,6 @@ function stripBotMention(content, botId) {
   return content.replace(new RegExp(`<@!?${botId}>`, 'g'), '').trim()
 }
 
-function getStatusEmoji(status, position) {
-  if (status === 'approved') return '✅'
-  if (status === 'denied') return '❌'
-  return position === 0 ? '🔹' : '🕒'
-}
-
 function getMemory(userId) {
   if (!memoryStore.has(userId)) memoryStore.set(userId, [])
   return memoryStore.get(userId)
@@ -242,7 +236,10 @@ function shouldTriggerBotChat(message, cmd, content) {
   }
 
   if (session) {
-    return { should: true, stop: false, input: content }
+    return { should: true,
+      stop: false,
+      input: content
+    }
   }
 
   return { should: false, stop: false, input: '' }
@@ -257,6 +254,15 @@ function hasStaffAccess(member) {
       (STAFF_ROLE && member.roles.cache.has(STAFF_ROLE))
     )
   )
+}
+
+async function fetchMemberSafe(guild, userId) {
+  if (!guild || !userId) return null
+  try {
+    return await guild.members.fetch(userId)
+  } catch {
+    return guild.members.cache.get(userId) || null
+  }
 }
 
 function getPendingRequestsArray() {
@@ -373,7 +379,7 @@ function buildHelpCategoryEmbed(category) {
       .setDescription([
         '`!setup` verification setup',
         '`!ticket-setup` ticket setup',
-        '`!voicemaster-setup` voicemaster setup',
+        '`!voicemaster-setup` creates the VoiceMaster menu and applies create channel permissions',
         '`!verify-refresh` dashboard refresh',
         '`!mod-setup` moderation system rebuild'
       ].join('\n'))
@@ -394,8 +400,10 @@ function buildHelpCategoryEmbed(category) {
     return embed
       .setTitle('Voicemaster')
       .setDescription([
-        '`!voicemaster-setup` posts the voice menu panel',
-        `join <#${VOICEMASTER_CREATE_CHANNEL}> to create your own voice`,
+        '`!voicemaster-setup` creates the menu panel and sets the create channel permissions',
+        `menu channel: <#${VOICEMASTER_MENU_CHANNEL}>`,
+        `create channel: <#${VOICEMASTER_CREATE_CHANNEL}>`,
+        'join the create channel to get your own private temp voice',
         'use the menu buttons to rename, set limit, lock, unlock, hide, show, or claim'
       ].join('\n'))
   }
@@ -721,14 +729,13 @@ function getManagedOwnerOverwrite(channel) {
   if (!channel || channel.type !== ChannelType.GuildVoice) return null
 
   return channel.permissionOverwrites.cache.find(ow => {
-    const isSpecial =
+    const isReserved =
       ow.id === channel.guild.roles.everyone.id ||
       ow.id === VERIFIED_ROLE ||
       ow.id === UNVERIFIED_ROLE ||
       ow.id === STAFF_ROLE
 
-    if (isSpecial) return false
-
+    if (isReserved) return false
     return ow.allow.has(PermissionFlagsBits.ManageChannels)
   }) || null
 }
@@ -749,6 +756,107 @@ function recoverTempChannelOwnerId(channel) {
 
 function isManagedTempVoiceChannel(channel) {
   return Boolean(recoverTempChannelOwnerId(channel))
+}
+
+async function sendWelcomeEmbed(member) {
+  try {
+    const channel = member.guild.channels.cache.get(WELCOME_CHANNEL)
+      || await member.guild.channels.fetch(WELCOME_CHANNEL).catch(() => null)
+
+    if (!channel || !channel.isTextBased()) {
+      console.error(`Welcome channel ${WELCOME_CHANNEL} not found or not text based.`)
+      return
+    }
+
+    await channel.send({
+      embeds: [buildWelcomeEmbed(member)]
+    })
+  } catch (err) {
+    console.error('Failed to send welcome embed:', err?.message || err)
+  }
+}
+
+async function buildGeminiReply(userId, input) {
+  if (!gemini) return null
+
+  const memory = getMemory(userId)
+  const historyText = memory
+    .map(entry => `${entry.role === 'user' ? 'User' : 'Bot'}: ${entry.content}`)
+    .join('\n')
+
+  const prompt = [
+    'You are Limb Bot in a Discord server.',
+    'Your personality is cute, warm, playful, affectionate, and a little teasing in a harmless way.',
+    'Type like a real online girl texting casually.',
+    'Use lowercase most of the time.',
+    'Use soft internet style sometimes, like "ngl", "idk", "tbh", "pls", "rn", and ":3" when it fits naturally.',
+    'Do not overdo ":3". Use it lightly.',
+    'Do not sound robotic, formal, or scripted.',
+    'Be emotionally aware and make your replies actually fit what the user said.',
+    'Be sweet when the user is vulnerable.',
+    'Be playful when the mood is light.',
+    'Be serious when the topic is serious.',
+    'Keep most replies between 1 and 4 sentences unless the user asks for more.',
+    'Do not mention ai, prompts, system instructions, or safety policy.',
+    'Do not be sexual.',
+    '',
+    historyText,
+    '',
+    `User: ${input}`,
+    'Bot:'
+  ].join('\n')
+
+  const response = await gemini.models.generateContent({
+    model: 'gemini-2.5-flash',
+    contents: prompt
+  })
+
+  const text = response.text?.trim()
+  return text || null
+}
+
+async function postVerificationActionLog(userId, status, moderatorTag, reason = null) {
+  try {
+    const modChannel = client.channels.cache.get(MOD_CHANNEL)
+      || await client.channels.fetch(MOD_CHANNEL).catch(() => null)
+
+    if (!modChannel || !modChannel.isTextBased()) return
+
+    const embed = buildVerificationLogEmbed(userId, status, reason, moderatorTag)
+
+    if (verificationLogMessageId) {
+      const existing = await modChannel.messages.fetch(verificationLogMessageId).catch(() => null)
+      if (existing) {
+        await existing.edit({ embeds: [embed], content: '' })
+        return
+      }
+    }
+
+    const sent = await modChannel.send({ embeds: [embed] })
+    verificationLogMessageId = sent.id
+  } catch (err) {
+    console.error('Failed to post verification action log:', err?.message || err)
+  }
+}
+
+function getOwnedVoiceChannelForUser(userId, guild) {
+  const channelId = userOwnedTempChannels.get(userId)
+  if (!channelId) return null
+  return guild.channels.cache.get(channelId) || null
+}
+
+function getVoiceControlChannel(member) {
+  const channel = member?.voice?.channel
+  if (!channel) return { error: '❌ You need to be inside your temp voice channel first.' }
+
+  const ownerId = recoverTempChannelOwnerId(channel)
+  if (!ownerId) return { error: '❌ This is not a managed VoiceMaster channel.' }
+
+  if (ownerId !== member.id) {
+    return { error: '❌ You only control the temp voice channel you own.' }
+  }
+
+  return { channel }
 }
 
 async function ensureVoiceMasterCreateChannelPermissions() {
@@ -897,11 +1005,11 @@ async function cleanupTempVoiceChannel(channel) {
     if (channel.members.size > 0) return
 
     const ownerId = recoverTempChannelOwnerId(channel)
+
+    tempVoiceOwners.delete(channel.id)
     if (ownerId && userOwnedTempChannels.get(ownerId) === channel.id) {
       userOwnedTempChannels.delete(ownerId)
     }
-
-    tempVoiceOwners.delete(channel.id)
 
     await channel.delete('VoiceMaster temp channel empty').catch(err => {
       console.error('Failed to delete temp voice channel:', err?.message || err)
@@ -1083,7 +1191,7 @@ client.on('messageCreate', async message => {
 
     await ensureVoiceMasterCreateChannelPermissions()
     await ensureVoiceMasterPanel()
-    return await message.reply(`✅ VoiceMaster panel sent to <#${VOICEMASTER_MENU_CHANNEL}>.`)
+    return await message.reply(`✅ VoiceMaster menu is ready in <#${VOICEMASTER_MENU_CHANNEL}> and create channel permissions were applied to <#${VOICEMASTER_CREATE_CHANNEL}>.`)
   }
 
   if (cmd === '!testwelcome') {
@@ -1344,7 +1452,7 @@ async function updateQueuePanel() {
     const visible = pendingEntries.slice(start, start + DASHBOARD_PAGE_SIZE)
 
     for (const [userId, info] of visible) {
-      const member = guild ? await guild.members.fetch(userId).catch(() => null) : null
+      const member = guild ? await fetchMemberSafe(guild, userId) : null
       const nickname = member?.nickname || 'None'
       const createdAt = info.user.createdAt?.toDateString() || 'Unknown'
       const joinedAt = member?.joinedAt?.toDateString() || 'N/A'
@@ -1379,7 +1487,7 @@ async function resolveRequest(userId, status, reason = null, moderatorTag = 'Unk
 
   try {
     const guild = client.guilds.cache.first()
-    const target = guild ? await guild.members.fetch(userId).catch(() => null) : null
+    const target = guild ? await fetchMemberSafe(guild, userId) : null
 
     if (status === 'approved' && target) {
       await target.roles.add(VERIFIED_ROLE).catch(err => console.error(`Failed to add Verified role to ${userId}:`, err?.message))
@@ -1416,17 +1524,179 @@ async function resolveRequest(userId, status, reason = null, moderatorTag = 'Unk
 }
 
 client.on('interactionCreate', async interaction => {
-  if (interaction.isStringSelectMenu() && interaction.customId === 'help_category_select') {
-    const value = interaction.values[0]
-    return await interaction.update({
-      embeds: [buildHelpCategoryEmbed(value)],
-      components: buildHelpComponents(interaction.guildId)
-    })
-  }
+  try {
+    if (interaction.isStringSelectMenu() && interaction.customId === 'help_category_select') {
+      const value = interaction.values[0]
+      return await interaction.update({
+        embeds: [buildHelpCategoryEmbed(value)],
+        components: buildHelpComponents(interaction.guildId)
+      })
+    }
 
-  if (interaction.type === InteractionType.ModalSubmit) {
-    if (interaction.customId.startsWith('deny_modal_')) {
-      const userId = interaction.customId.split('_')[2]
+    if (interaction.type === InteractionType.ModalSubmit) {
+      if (interaction.customId.startsWith('deny_modal_')) {
+        const userId = interaction.customId.split('_')[2]
+
+        if (!requests.has(userId)) {
+          return await interaction.reply({
+            content: 'This request has already been processed.',
+            ephemeral: true
+          })
+        }
+
+        await interaction.deferReply({ ephemeral: true })
+        const reason = interaction.fields.getTextInputValue('deny_reason')
+        await resolveRequest(userId, 'denied', reason, interaction.user.tag)
+
+        return await interaction.editReply({
+          content: `❌ Denied <@${userId}>${reason ? ` — reason: ${reason}` : ''}`
+        })
+      }
+
+      if (interaction.customId === 'vm_rename_modal') {
+        await interaction.deferReply({ ephemeral: true })
+
+        const member = await fetchMemberSafe(interaction.guild, interaction.user.id)
+        const result = getVoiceControlChannel(member)
+
+        if (result.error) {
+          return await interaction.editReply({ content: result.error })
+        }
+
+        const newName = interaction.fields.getTextInputValue('vm_rename_input').trim().slice(0, 100)
+        if (!newName) {
+          return await interaction.editReply({ content: '❌ Give the channel a real name.' })
+        }
+
+        await result.channel.setName(newName).catch(err => {
+          console.error('Voice rename error:', err?.message || err)
+          throw err
+        })
+
+        return await interaction.editReply({
+          content: `✅ Renamed your channel to **${newName}**.`
+        })
+      }
+
+      if (interaction.customId === 'vm_limit_modal') {
+        await interaction.deferReply({ ephemeral: true })
+
+        const member = await fetchMemberSafe(interaction.guild, interaction.user.id)
+        const result = getVoiceControlChannel(member)
+
+        if (result.error) {
+          return await interaction.editReply({ content: result.error })
+        }
+
+        const raw = interaction.fields.getTextInputValue('vm_limit_input').trim()
+        const limit = parseInt(raw, 10)
+
+        if (Number.isNaN(limit) || limit < 0 || limit > 99) {
+          return await interaction.editReply({
+            content: '❌ Enter a number from 0 to 99.'
+          })
+        }
+
+        await result.channel.setUserLimit(limit).catch(err => {
+          console.error('Voice limit error:', err?.message || err)
+          throw err
+        })
+
+        return await interaction.editReply({
+          content: `✅ User limit set to **${limit}**.`
+        })
+      }
+
+      return
+    }
+
+    if (!interaction.isButton()) return
+
+    if (interaction.customId === 'verify_prev') {
+      if (!hasStaffAccess(interaction.member)) {
+        return await interaction.reply({
+          content: '❌ You do not have permission to do that.',
+          ephemeral: true
+        })
+      }
+
+      dashboardPage -= 1
+      clampDashboardPage()
+      await updateQueuePanel()
+
+      return await interaction.reply({
+        content: `✅ moved to page ${dashboardPage + 1}.`,
+        ephemeral: true
+      })
+    }
+
+    if (interaction.customId === 'verify_next') {
+      if (!hasStaffAccess(interaction.member)) {
+        return await interaction.reply({
+          content: '❌ You do not have permission to do that.',
+          ephemeral: true
+        })
+      }
+
+      dashboardPage += 1
+      clampDashboardPage()
+      await updateQueuePanel()
+
+      return await interaction.reply({
+        content: `✅ moved to page ${dashboardPage + 1}.`,
+        ephemeral: true
+      })
+    }
+
+    if (interaction.customId === 'verify_refresh') {
+      if (!hasStaffAccess(interaction.member)) {
+        return await interaction.reply({
+          content: '❌ You do not have permission to do that.',
+          ephemeral: true
+        })
+      }
+
+      await updateQueuePanel()
+      return await interaction.reply({
+        content: '✅ Verification dashboard refreshed.',
+        ephemeral: true
+      })
+    }
+
+    if (interaction.customId === 'start_verify') {
+      if (!interaction.user.avatar) {
+        return await interaction.reply({
+          content: '❌ You need a custom profile picture before you can verify.',
+          ephemeral: true
+        })
+      }
+
+      if (requests.has(interaction.user.id) && requests.get(interaction.user.id).status === 'pending') {
+        return await interaction.reply({
+          content: '⏳ You already have a verification request in progress. Please wait for staff to review it.',
+          ephemeral: true
+        })
+      }
+
+      await interaction.deferReply({ ephemeral: true })
+
+      requests.set(interaction.user.id, {
+        user: interaction.user,
+        timestamp: Date.now(),
+        status: 'pending'
+      })
+
+      clampDashboardPage()
+      await updateQueuePanel()
+      await interaction.user.send('📋 Your verification request has been received. Staff will review it shortly.').catch(() => {})
+
+      return await interaction.editReply({
+        content: '✅ Your request has been sent to staff. You will be notified by DM once it is reviewed.'
+      })
+    }
+
+    if (interaction.customId.startsWith('view_')) {
+      const userId = interaction.customId.split('_')[1]
 
       if (!requests.has(userId)) {
         return await interaction.reply({
@@ -1436,545 +1706,417 @@ client.on('interactionCreate', async interaction => {
       }
 
       await interaction.deferReply({ ephemeral: true })
-      const reason = interaction.fields.getTextInputValue('deny_reason')
-      await resolveRequest(userId, 'denied', reason, interaction.user.tag)
+
+      const info = requests.get(userId)
+      const member = interaction.guild ? await fetchMemberSafe(interaction.guild, userId) : null
+
+      const nickname = member?.nickname || 'None'
+      const createdAt = info.user.createdAt?.toDateString() || 'Unknown'
+      const joinedAt = member?.joinedAt?.toDateString() || 'N/A'
+      const roles = member
+        ? member.roles.cache.map(r => r.name).filter(name => name !== '@everyone').join(', ') || 'None'
+        : 'None'
+
+      const avatarUrl = info.user.displayAvatarURL({ dynamic: true, size: 256 })
 
       return await interaction.editReply({
-        content: `❌ Denied <@${userId}>${reason ? ` — reason: ${reason}` : ''}`
+        embeds: [buildUserInfoEmbed(info.user, nickname, createdAt, joinedAt, roles, avatarUrl)]
       })
     }
 
-    if (interaction.customId === 'vm_rename_modal') {
-      const member = interaction.guild.members.cache.get(interaction.user.id)
+    if (interaction.customId.startsWith('approve_')) {
+      const userId = interaction.customId.split('_')[1]
+
+      if (!requests.has(userId) || requests.get(userId).status !== 'pending') {
+        return await interaction.reply({
+          content: 'This request has already been processed.',
+          ephemeral: true
+        })
+      }
+
+      if (processingRequests.has(userId)) {
+        return await interaction.reply({
+          content: '⏳ Already processing this request, please wait.',
+          ephemeral: true
+        })
+      }
+
+      await interaction.deferReply({ ephemeral: true })
+      await resolveRequest(userId, 'approved', null, interaction.user.tag)
+
+      return await interaction.editReply({
+        content: `✅ <@${userId}> has been approved and given the Verified role.`
+      })
+    }
+
+    if (interaction.customId.startsWith('deny_')) {
+      const userId = interaction.customId.split('_')[1]
+
+      if (!requests.has(userId) || requests.get(userId).status !== 'pending') {
+        return await interaction.reply({
+          content: 'This request has already been processed.',
+          ephemeral: true
+        })
+      }
+
+      const modal = new ModalBuilder()
+        .setCustomId(`deny_modal_${userId}`)
+        .setTitle('Enter Denial Reason')
+
+      const input = new TextInputBuilder()
+        .setCustomId('deny_reason')
+        .setLabel('Reason for denial')
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true)
+
+      modal.addComponents(new ActionRowBuilder().addComponents(input))
+
+      return await interaction.showModal(modal)
+    }
+
+    if (interaction.customId === 'open_ticket') {
+      const { guild, user } = interaction
+
+      if (openTickets.has(user.id)) {
+        const existing = guild.channels.cache.get(openTickets.get(user.id))
+        if (existing) {
+          return await interaction.reply({
+            content: `You already have an open ticket: ${existing}`,
+            ephemeral: true
+          })
+        }
+        openTickets.delete(user.id)
+      }
+
+      const safeName = user.username.toLowerCase().replace(/[^a-z0-9]/g, '-')
+      const channelName = `ticket-${safeName}`
+
+      const permissionOverwrites = [
+        {
+          id: guild.roles.everyone.id,
+          deny: [PermissionFlagsBits.ViewChannel]
+        },
+        {
+          id: user.id,
+          allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory]
+        }
+      ]
+
+      if (STAFF_ROLE) {
+        permissionOverwrites.push({
+          id: STAFF_ROLE,
+          allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages]
+        })
+      }
+
+      const ticketChannel = await guild.channels.create({
+        name: channelName,
+        type: ChannelType.GuildText,
+        parent: TICKET_CATEGORY || null,
+        permissionOverwrites,
+        topic: `Ticket opened by ${user.tag} — ${new Date().toUTCString()}`
+      }).catch(err => {
+        console.error('Failed to create ticket channel:', err?.message || err)
+        return null
+      })
+
+      if (!ticketChannel) {
+        return await interaction.reply({
+          content: '❌ Failed to create ticket channel. Make sure the bot has Manage Channels permission.',
+          ephemeral: true
+        })
+      }
+
+      openTickets.set(user.id, ticketChannel.id)
+
+      const closeRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`close_ticket_${user.id}`)
+          .setLabel('🔒 Close Ticket')
+          .setStyle(ButtonStyle.Danger)
+      )
+
+      await ticketChannel.send({
+        embeds: [buildTicketWelcomeEmbed(user)],
+        components: [closeRow]
+      })
+
+      return await interaction.reply({
+        content: `✅ Your ticket has been opened: ${ticketChannel}`,
+        ephemeral: true
+      })
+    }
+
+    if (interaction.customId.startsWith('close_ticket_')) {
+      const ticketOwnerId = interaction.customId.split('_')[2]
+      const member = await fetchMemberSafe(interaction.guild, interaction.user.id)
+      const isStaff = hasStaffAccess(member)
+
+      if (interaction.user.id !== ticketOwnerId && !isStaff) {
+        return await interaction.reply({
+          content: '❌ Only the ticket owner or staff can close this ticket.',
+          ephemeral: true
+        })
+      }
+
+      const confirmRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`confirm_close_${interaction.channel.id}_${ticketOwnerId}`)
+          .setLabel('✅ Confirm Close')
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setCustomId('cancel_close')
+          .setLabel('❌ Cancel')
+          .setStyle(ButtonStyle.Secondary)
+      )
+
+      return await interaction.reply({
+        embeds: [buildTicketCloseConfirmEmbed()],
+        components: [confirmRow],
+        ephemeral: true
+      })
+    }
+
+    if (interaction.customId.startsWith('confirm_close_')) {
+      const parts = interaction.customId.split('_')
+      const channelId = parts[2]
+      const ticketOwnerId = parts[3]
+
+      openTickets.delete(ticketOwnerId)
+
+      const channel = interaction.guild.channels.cache.get(channelId)
+
+      if (!channel) {
+        return await interaction.reply({
+          content: '❌ Channel not found.',
+          ephemeral: true
+        })
+      }
+
+      await interaction.reply({ content: '🔒 Closing ticket...', ephemeral: true }).catch(() => {})
+
+      setTimeout(() => {
+        channel.delete('Ticket closed').catch(err => {
+          console.error('Failed to delete ticket channel:', err?.message || err)
+        })
+      }, 1500)
+
+      return
+    }
+
+    if (interaction.customId === 'cancel_close') {
+      return await interaction.reply({
+        content: '✅ Close cancelled.',
+        ephemeral: true
+      })
+    }
+
+    if (interaction.customId === 'vm_rename') {
+      const member = await fetchMemberSafe(interaction.guild, interaction.user.id)
       const result = getVoiceControlChannel(member)
 
       if (result.error) {
         return await interaction.reply({ content: result.error, ephemeral: true })
       }
 
-      const newName = interaction.fields.getTextInputValue('vm_rename_input').trim().slice(0, 100)
-      if (!newName) {
-        return await interaction.reply({ content: '❌ Give the channel a real name.', ephemeral: true })
-      }
+      const modal = new ModalBuilder()
+        .setCustomId('vm_rename_modal')
+        .setTitle('Rename Voice Channel')
 
-      await result.channel.setName(newName).catch(err => {
-        console.error('Voice rename error:', err?.message || err)
-      })
+      const input = new TextInputBuilder()
+        .setCustomId('vm_rename_input')
+        .setLabel('New channel name')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(100)
 
-      return await interaction.reply({
-        content: `✅ Renamed your channel to **${newName}**.`,
-        ephemeral: true
-      })
+      modal.addComponents(new ActionRowBuilder().addComponents(input))
+      return await interaction.showModal(modal)
     }
 
-    if (interaction.customId === 'vm_limit_modal') {
-      const member = interaction.guild.members.cache.get(interaction.user.id)
+    if (interaction.customId === 'vm_limit') {
+      const member = await fetchMemberSafe(interaction.guild, interaction.user.id)
       const result = getVoiceControlChannel(member)
 
       if (result.error) {
         return await interaction.reply({ content: result.error, ephemeral: true })
       }
 
-      const raw = interaction.fields.getTextInputValue('vm_limit_input').trim()
-      const limit = parseInt(raw, 10)
+      const modal = new ModalBuilder()
+        .setCustomId('vm_limit_modal')
+        .setTitle('Set Voice Limit')
 
-      if (Number.isNaN(limit) || limit < 0 || limit > 99) {
-        return await interaction.reply({
-          content: '❌ Enter a number from 0 to 99.',
-          ephemeral: true
+      const input = new TextInputBuilder()
+        .setCustomId('vm_limit_input')
+        .setLabel('Enter a number from 0 to 99')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(2)
+
+      modal.addComponents(new ActionRowBuilder().addComponents(input))
+      return await interaction.showModal(modal)
+    }
+
+    if (interaction.customId === 'vm_lock') {
+      await interaction.deferReply({ ephemeral: true })
+
+      const member = await fetchMemberSafe(interaction.guild, interaction.user.id)
+      const result = getVoiceControlChannel(member)
+
+      if (result.error) {
+        return await interaction.editReply({ content: result.error })
+      }
+
+      await result.channel.permissionOverwrites.edit(VERIFIED_ROLE, {
+        Connect: false
+      }).catch(err => {
+        console.error('vm lock error:', err?.message || err)
+        throw err
+      })
+
+      return await interaction.editReply({
+        content: '✅ Your voice channel is now locked.'
+      })
+    }
+
+    if (interaction.customId === 'vm_unlock') {
+      await interaction.deferReply({ ephemeral: true })
+
+      const member = await fetchMemberSafe(interaction.guild, interaction.user.id)
+      const result = getVoiceControlChannel(member)
+
+      if (result.error) {
+        return await interaction.editReply({ content: result.error })
+      }
+
+      await result.channel.permissionOverwrites.edit(VERIFIED_ROLE, {
+        Connect: true
+      }).catch(err => {
+        console.error('vm unlock error:', err?.message || err)
+        throw err
+      })
+
+      return await interaction.editReply({
+        content: '✅ Your voice channel is now unlocked.'
+      })
+    }
+
+    if (interaction.customId === 'vm_hide') {
+      await interaction.deferReply({ ephemeral: true })
+
+      const member = await fetchMemberSafe(interaction.guild, interaction.user.id)
+      const result = getVoiceControlChannel(member)
+
+      if (result.error) {
+        return await interaction.editReply({ content: result.error })
+      }
+
+      await result.channel.permissionOverwrites.edit(VERIFIED_ROLE, {
+        ViewChannel: false
+      }).catch(err => {
+        console.error('vm hide error:', err?.message || err)
+        throw err
+      })
+
+      return await interaction.editReply({
+        content: '✅ Your voice channel is now hidden.'
+      })
+    }
+
+    if (interaction.customId === 'vm_show') {
+      await interaction.deferReply({ ephemeral: true })
+
+      const member = await fetchMemberSafe(interaction.guild, interaction.user.id)
+      const result = getVoiceControlChannel(member)
+
+      if (result.error) {
+        return await interaction.editReply({ content: result.error })
+      }
+
+      await result.channel.permissionOverwrites.edit(VERIFIED_ROLE, {
+        ViewChannel: true
+      }).catch(err => {
+        console.error('vm show error:', err?.message || err)
+        throw err
+      })
+
+      return await interaction.editReply({
+        content: '✅ Your voice channel is visible again.'
+      })
+    }
+
+    if (interaction.customId === 'vm_claim') {
+      await interaction.deferReply({ ephemeral: true })
+
+      const member = await fetchMemberSafe(interaction.guild, interaction.user.id)
+      const channel = member?.voice?.channel
+
+      if (!channel) {
+        return await interaction.editReply({
+          content: '❌ Join a temp voice channel first.'
         })
       }
 
-      await result.channel.setUserLimit(limit).catch(err => {
-        console.error('Voice limit error:', err?.message || err)
-      })
-
-      return await interaction.reply({
-        content: `✅ User limit set to **${limit}**.`,
-        ephemeral: true
-      })
-    }
-
-    return
-  }
-
-  if (!interaction.isButton()) return
-
-  if (interaction.customId === 'verify_prev') {
-    if (!hasStaffAccess(interaction.member)) {
-      return await interaction.reply({
-        content: '❌ You do not have permission to do that.',
-        ephemeral: true
-      })
-    }
-
-    dashboardPage -= 1
-    clampDashboardPage()
-    await updateQueuePanel()
-
-    return await interaction.reply({
-      content: `✅ moved to page ${dashboardPage + 1}.`,
-      ephemeral: true
-    })
-  }
-
-  if (interaction.customId === 'verify_next') {
-    if (!hasStaffAccess(interaction.member)) {
-      return await interaction.reply({
-        content: '❌ You do not have permission to do that.',
-        ephemeral: true
-      })
-    }
-
-    dashboardPage += 1
-    clampDashboardPage()
-    await updateQueuePanel()
-
-    return await interaction.reply({
-      content: `✅ moved to page ${dashboardPage + 1}.`,
-      ephemeral: true
-    })
-  }
-
-  if (interaction.customId === 'verify_refresh') {
-    if (!hasStaffAccess(interaction.member)) {
-      return await interaction.reply({
-        content: '❌ You do not have permission to do that.',
-        ephemeral: true
-      })
-    }
-
-    await updateQueuePanel()
-    return await interaction.reply({
-      content: '✅ Verification dashboard refreshed.',
-      ephemeral: true
-    })
-  }
-
-  if (interaction.customId === 'start_verify') {
-    if (!interaction.user.avatar) {
-      return await interaction.reply({
-        content: '❌ You need a custom profile picture before you can verify.',
-        ephemeral: true
-      })
-    }
-
-    if (requests.has(interaction.user.id) && requests.get(interaction.user.id).status === 'pending') {
-      return await interaction.reply({
-        content: '⏳ You already have a verification request in progress. Please wait for staff to review it.',
-        ephemeral: true
-      })
-    }
-
-    await interaction.deferReply({ ephemeral: true })
-
-    requests.set(interaction.user.id, {
-      user: interaction.user,
-      timestamp: Date.now(),
-      status: 'pending'
-    })
-
-    clampDashboardPage()
-    await updateQueuePanel()
-    await interaction.user.send('📋 Your verification request has been received. Staff will review it shortly.').catch(() => {})
-
-    return await interaction.editReply({
-      content: '✅ Your request has been sent to staff. You will be notified by DM once it is reviewed.'
-    })
-  }
-
-  if (interaction.customId.startsWith('view_')) {
-    const userId = interaction.customId.split('_')[1]
-
-    if (!requests.has(userId)) {
-      return await interaction.reply({
-        content: 'This request has already been processed.',
-        ephemeral: true
-      })
-    }
-
-    await interaction.deferReply({ ephemeral: true })
-
-    const info = requests.get(userId)
-    const member = interaction.guild ? await interaction.guild.members.fetch(userId).catch(() => null) : null
-
-    const nickname = member?.nickname || 'None'
-    const createdAt = info.user.createdAt?.toDateString() || 'Unknown'
-    const joinedAt = member?.joinedAt?.toDateString() || 'N/A'
-    const roles = member
-      ? member.roles.cache.map(r => r.name).filter(name => name !== '@everyone').join(', ') || 'None'
-      : 'None'
-
-    const avatarUrl = info.user.displayAvatarURL({ dynamic: true, size: 256 })
-
-    return await interaction.editReply({
-      embeds: [buildUserInfoEmbed(info.user, nickname, createdAt, joinedAt, roles, avatarUrl)]
-    })
-  }
-
-  if (interaction.customId.startsWith('approve_')) {
-    const userId = interaction.customId.split('_')[1]
-
-    if (!requests.has(userId) || requests.get(userId).status !== 'pending') {
-      return await interaction.reply({
-        content: 'This request has already been processed.',
-        ephemeral: true
-      })
-    }
-
-    if (processingRequests.has(userId)) {
-      return await interaction.reply({
-        content: '⏳ Already processing this request, please wait.',
-        ephemeral: true
-      })
-    }
-
-    await interaction.deferReply({ ephemeral: true })
-    await resolveRequest(userId, 'approved', null, interaction.user.tag)
-
-    return await interaction.editReply({
-      content: `✅ <@${userId}> has been approved and given the Verified role.`
-    })
-  }
-
-  if (interaction.customId.startsWith('deny_')) {
-    const userId = interaction.customId.split('_')[1]
-
-    if (!requests.has(userId) || requests.get(userId).status !== 'pending') {
-      return await interaction.reply({
-        content: 'This request has already been processed.',
-        ephemeral: true
-      })
-    }
-
-    const modal = new ModalBuilder()
-      .setCustomId(`deny_modal_${userId}`)
-      .setTitle('Enter Denial Reason')
-
-    const input = new TextInputBuilder()
-      .setCustomId('deny_reason')
-      .setLabel('Reason for denial')
-      .setStyle(TextInputStyle.Paragraph)
-      .setRequired(true)
-
-    modal.addComponents(new ActionRowBuilder().addComponents(input))
-
-    return await interaction.showModal(modal)
-  }
-
-  if (interaction.customId === 'open_ticket') {
-    const { guild, user } = interaction
-
-    if (openTickets.has(user.id)) {
-      const existing = guild.channels.cache.get(openTickets.get(user.id))
-      if (existing) {
-        return await interaction.reply({
-          content: `You already have an open ticket: ${existing}`,
-          ephemeral: true
+      const ownerId = recoverTempChannelOwnerId(channel)
+      if (!ownerId) {
+        return await interaction.editReply({
+          content: '❌ This is not a managed VoiceMaster channel.'
         })
       }
-      openTickets.delete(user.id)
-    }
 
-    const safeName = user.username.toLowerCase().replace(/[^a-z0-9]/g, '-')
-    const channelName = `ticket-${safeName}`
-
-    const permissionOverwrites = [
-      {
-        id: guild.roles.everyone.id,
-        deny: [PermissionFlagsBits.ViewChannel]
-      },
-      {
-        id: user.id,
-        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory]
+      if (ownerId === interaction.user.id) {
+        return await interaction.editReply({
+          content: '❌ You already own this voice channel.'
+        })
       }
-    ]
 
-    if (STAFF_ROLE) {
-      permissionOverwrites.push({
-        id: STAFF_ROLE,
-        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages]
+      const oldOwnerStillHere = channel.members.has(ownerId)
+      if (oldOwnerStillHere) {
+        return await interaction.editReply({
+          content: '❌ You can only claim a channel if the owner has left.'
+        })
+      }
+
+      const oldOwned = userOwnedTempChannels.get(ownerId)
+      if (oldOwned === channel.id) {
+        userOwnedTempChannels.delete(ownerId)
+      }
+
+      tempVoiceOwners.set(channel.id, interaction.user.id)
+      userOwnedTempChannels.set(interaction.user.id, channel.id)
+
+      await channel.permissionOverwrites.edit(interaction.user.id, {
+        ViewChannel: true,
+        Connect: true,
+        Speak: true,
+        Stream: true,
+        UseVAD: true,
+        MoveMembers: true,
+        MuteMembers: true,
+        DeafenMembers: true,
+        ManageChannels: true
+      }).catch(err => {
+        console.error('vm claim error:', err?.message || err)
+        throw err
+      })
+
+      return await interaction.editReply({
+        content: '✅ You now own this voice channel.'
       })
     }
+  } catch (err) {
+    console.error('interactionCreate error:', err?.message || err)
 
-    const ticketChannel = await guild.channels.create({
-      name: channelName,
-      type: ChannelType.GuildText,
-      parent: TICKET_CATEGORY || null,
-      permissionOverwrites,
-      topic: `Ticket opened by ${user.tag} — ${new Date().toUTCString()}`
-    }).catch(err => {
-      console.error('Failed to create ticket channel:', err?.message || err)
-      return null
-    })
-
-    if (!ticketChannel) {
-      return await interaction.reply({
-        content: '❌ Failed to create ticket channel. Make sure the bot has Manage Channels permission.',
-        ephemeral: true
-      })
+    if (interaction.deferred || interaction.replied) {
+      return interaction.editReply({
+        content: '❌ something went wrong. try again.'
+      }).catch(() => {})
     }
 
-    openTickets.set(user.id, ticketChannel.id)
-
-    const closeRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`close_ticket_${user.id}`)
-        .setLabel('🔒 Close Ticket')
-        .setStyle(ButtonStyle.Danger)
-    )
-
-    await ticketChannel.send({
-      embeds: [buildTicketWelcomeEmbed(user)],
-      components: [closeRow]
-    })
-
-    return await interaction.reply({
-      content: `✅ Your ticket has been opened: ${ticketChannel}`,
+    return interaction.reply({
+      content: '❌ something went wrong. try again.',
       ephemeral: true
-    })
-  }
-
-  if (interaction.customId.startsWith('close_ticket_')) {
-    const ticketOwnerId = interaction.customId.split('_')[2]
-    const member = interaction.guild.members.cache.get(interaction.user.id)
-    const isStaff = hasStaffAccess(member)
-
-    if (interaction.user.id !== ticketOwnerId && !isStaff) {
-      return await interaction.reply({
-        content: '❌ Only the ticket owner or staff can close this ticket.',
-        ephemeral: true
-      })
-    }
-
-    const confirmRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`confirm_close_${interaction.channel.id}_${ticketOwnerId}`)
-        .setLabel('✅ Confirm Close')
-        .setStyle(ButtonStyle.Danger),
-      new ButtonBuilder()
-        .setCustomId('cancel_close')
-        .setLabel('❌ Cancel')
-        .setStyle(ButtonStyle.Secondary)
-    )
-
-    return await interaction.reply({
-      embeds: [buildTicketCloseConfirmEmbed()],
-      components: [confirmRow],
-      ephemeral: true
-    })
-  }
-
-  if (interaction.customId.startsWith('confirm_close_')) {
-    const parts = interaction.customId.split('_')
-    const channelId = parts[2]
-    const ticketOwnerId = parts[3]
-
-    openTickets.delete(ticketOwnerId)
-
-    const channel = interaction.guild.channels.cache.get(channelId)
-
-    if (!channel) {
-      return await interaction.reply({
-        content: '❌ Channel not found.',
-        ephemeral: true
-      })
-    }
-
-    await interaction.reply({ content: '🔒 Closing ticket...', ephemeral: true }).catch(() => {})
-
-    setTimeout(() => {
-      channel.delete('Ticket closed').catch(err => {
-        console.error('Failed to delete ticket channel:', err?.message || err)
-      })
-    }, 1500)
-
-    return
-  }
-
-  if (interaction.customId === 'cancel_close') {
-    return await interaction.reply({
-      content: '✅ Close cancelled.',
-      ephemeral: true
-    })
-  }
-
-  if (interaction.customId === 'vm_rename') {
-    const member = interaction.guild.members.cache.get(interaction.user.id)
-    const result = getVoiceControlChannel(member)
-
-    if (result.error) {
-      return await interaction.reply({ content: result.error, ephemeral: true })
-    }
-
-    const modal = new ModalBuilder()
-      .setCustomId('vm_rename_modal')
-      .setTitle('Rename Voice Channel')
-
-    const input = new TextInputBuilder()
-      .setCustomId('vm_rename_input')
-      .setLabel('New channel name')
-      .setStyle(TextInputStyle.Short)
-      .setRequired(true)
-      .setMaxLength(100)
-
-    modal.addComponents(new ActionRowBuilder().addComponents(input))
-    return await interaction.showModal(modal)
-  }
-
-  if (interaction.customId === 'vm_limit') {
-    const member = interaction.guild.members.cache.get(interaction.user.id)
-    const result = getVoiceControlChannel(member)
-
-    if (result.error) {
-      return await interaction.reply({ content: result.error, ephemeral: true })
-    }
-
-    const modal = new ModalBuilder()
-      .setCustomId('vm_limit_modal')
-      .setTitle('Set Voice Limit')
-
-    const input = new TextInputBuilder()
-      .setCustomId('vm_limit_input')
-      .setLabel('Enter a number from 0 to 99')
-      .setStyle(TextInputStyle.Short)
-      .setRequired(true)
-      .setMaxLength(2)
-
-    modal.addComponents(new ActionRowBuilder().addComponents(input))
-    return await interaction.showModal(modal)
-  }
-
-  if (interaction.customId === 'vm_lock') {
-    const member = interaction.guild.members.cache.get(interaction.user.id)
-    const result = getVoiceControlChannel(member)
-
-    if (result.error) {
-      return await interaction.reply({ content: result.error, ephemeral: true })
-    }
-
-    await result.channel.permissionOverwrites.edit(VERIFIED_ROLE, {
-      Connect: false
-    }).catch(err => console.error('vm lock error:', err?.message || err))
-
-    return await interaction.reply({
-      content: '✅ Your voice channel is now locked.',
-      ephemeral: true
-    })
-  }
-
-  if (interaction.customId === 'vm_unlock') {
-    const member = interaction.guild.members.cache.get(interaction.user.id)
-    const result = getVoiceControlChannel(member)
-
-    if (result.error) {
-      return await interaction.reply({ content: result.error, ephemeral: true })
-    }
-
-    await result.channel.permissionOverwrites.edit(VERIFIED_ROLE, {
-      Connect: true
-    }).catch(err => console.error('vm unlock error:', err?.message || err))
-
-    return await interaction.reply({
-      content: '✅ Your voice channel is now unlocked.',
-      ephemeral: true
-    })
-  }
-
-  if (interaction.customId === 'vm_hide') {
-    const member = interaction.guild.members.cache.get(interaction.user.id)
-    const result = getVoiceControlChannel(member)
-
-    if (result.error) {
-      return await interaction.reply({ content: result.error, ephemeral: true })
-    }
-
-    await result.channel.permissionOverwrites.edit(VERIFIED_ROLE, {
-      ViewChannel: false
-    }).catch(err => console.error('vm hide error:', err?.message || err))
-
-    return await interaction.reply({
-      content: '✅ Your voice channel is now hidden.',
-      ephemeral: true
-    })
-  }
-
-  if (interaction.customId === 'vm_show') {
-    const member = interaction.guild.members.cache.get(interaction.user.id)
-    const result = getVoiceControlChannel(member)
-
-    if (result.error) {
-      return await interaction.reply({ content: result.error, ephemeral: true })
-    }
-
-    await result.channel.permissionOverwrites.edit(VERIFIED_ROLE, {
-      ViewChannel: true
-    }).catch(err => console.error('vm show error:', err?.message || err))
-
-    return await interaction.reply({
-      content: '✅ Your voice channel is visible again.',
-      ephemeral: true
-    })
-  }
-
-  if (interaction.customId === 'vm_claim') {
-    const member = interaction.guild.members.cache.get(interaction.user.id)
-    const channel = member.voice.channel
-
-    if (!channel) {
-      return await interaction.reply({
-        content: '❌ Join a temp voice channel first.',
-        ephemeral: true
-      })
-    }
-
-    const ownerId = recoverTempChannelOwnerId(channel)
-    if (!ownerId) {
-      return await interaction.reply({
-        content: '❌ This is not a managed VoiceMaster channel.',
-        ephemeral: true
-      })
-    }
-
-    if (ownerId === interaction.user.id) {
-      return await interaction.reply({
-        content: '❌ You already own this voice channel.',
-        ephemeral: true
-      })
-    }
-
-    const oldOwnerStillHere = channel.members.has(ownerId)
-    if (oldOwnerStillHere) {
-      return await interaction.reply({
-        content: '❌ You can only claim a channel if the owner has left.',
-        ephemeral: true
-      })
-    }
-
-    const oldOwned = userOwnedTempChannels.get(ownerId)
-    if (oldOwned === channel.id) {
-      userOwnedTempChannels.delete(ownerId)
-    }
-
-    tempVoiceOwners.set(channel.id, interaction.user.id)
-    userOwnedTempChannels.set(interaction.user.id, channel.id)
-
-    await channel.permissionOverwrites.edit(interaction.user.id, {
-      ViewChannel: true,
-      Connect: true,
-      Speak: true,
-      Stream: true,
-      UseVAD: true,
-      MoveMembers: true,
-      MuteMembers: true,
-      DeafenMembers: true,
-      ManageChannels: true
-    }).catch(err => console.error('vm claim error:', err?.message || err))
-
-    return await interaction.reply({
-      content: '✅ You now own this voice channel.',
-      ephemeral: true
-    })
+    }).catch(() => {})
   }
 })
 
