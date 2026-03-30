@@ -477,7 +477,7 @@ function buildWelcomeEmbed(member) {
     .setTitle('**Welcome to Limb!**')
     .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }))
     .setDescription(
-      `hey **${member.user.username}**, welcome to **Limb** \n\n` +
+      `Hey **${member.user.username}**, welcome to **Limb** \n\n` +
       `> 🎫 support: <#${TICKET_PANEL_CHANNEL}>\n` +
       `> 📜 rules: <#${RULES_CHANNEL}>\n\n` +
       'Enjoy your stay at Limb, have fun, and make yourself at home!'
