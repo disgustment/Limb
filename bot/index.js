@@ -639,10 +639,10 @@ function buildWelcomeEmbed(member) {
     .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }))
     .setDescription(
       `hey **${member.user.username}**, welcome to **Limb**\n\n` +
-      `> support: <#${TICKET_PANEL_CHANNEL}>\n` +
-      `> rules: <#${RULES_CHANNEL}>\n` +
-      `> verify: <#${VERIFY_CHANNEL}>\n\n` +
-      'Enjoy your stay at Limb and make yourself at home..'
+      `> <#${TICKET_PANEL_CHANNEL}>\n` +
+      `> <#${RULES_CHANNEL}>\n` +
+      `> <#${VERIFY_CHANNEL}>\n\n` +
+      'enjoy your stay at Limb and make yourself at home..'
     )
     .setFooter({ text: 'Limb • Welcome' })
     .setTimestamp()
